@@ -1,4 +1,5 @@
 #include "storage/pages/storage.h"
+#include "storage/pages/metadata.h"
 #include "storage/functions.hpp"
 
 static volatile Persistence::Pages::Storage _storage;
@@ -472,4 +473,52 @@ int getTournamentToggleSetting() {
 void setTournamentToggleSetting(const int tournamentToggle) {
 	getStoragePage();
 	_storage.settings.tournamentToggle = tournamentToggle;
+}
+
+// Controller metadata persistence
+
+static volatile Persistence::Pages::Metadata _metadata;
+static volatile bool metadataFresh = false;
+
+static void getMetadataPage() {
+	if(!metadataFresh) {
+		Persistence::Pages::Metadata temp = Persistence::clone<Persistence::Pages::Metadata>();
+		// Check if flash is blank (all 0xFF) and use defaults if so
+		bool blank = true;
+		for(int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+			if(temp.controllerMetadata[i] != 0xFF) {
+				blank = false;
+				break;
+			}
+		}
+		if(blank) {
+			_metadata.numChunks = 1;
+			memcpy((void*)_metadata.controllerMetadata, defaultControllerMetadata, METADATA_CHUNK_DATA_SIZE);
+			memset((void*)(_metadata.controllerMetadata + METADATA_CHUNK_DATA_SIZE), 0,
+			       CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
+		} else {
+			_metadata.numChunks = temp.numChunks;
+			if(_metadata.numChunks == 0 || _metadata.numChunks > METADATA_MAX_CHUNKS) {
+				_metadata.numChunks = 1;
+			}
+			memcpy((void*)_metadata.controllerMetadata, temp.controllerMetadata, CONTROLLER_METADATA_MAX_SIZE);
+		}
+		metadataFresh = true;
+	}
+}
+
+void getControllerMetadata(uint8_t *buf, uint8_t &numChunks) {
+	getMetadataPage();
+	numChunks = _metadata.numChunks;
+	memcpy(buf, (const void*)_metadata.controllerMetadata, CONTROLLER_METADATA_MAX_SIZE);
+}
+
+void setControllerMetadata(const uint8_t *buf, uint8_t numChunks) {
+	getMetadataPage();
+	_metadata.numChunks = numChunks;
+	memcpy((void*)_metadata.controllerMetadata, buf, CONTROLLER_METADATA_MAX_SIZE);
+}
+
+void commitMetadata(const bool noLock) {
+	Persistence::commit(_metadata, noLock);
 }

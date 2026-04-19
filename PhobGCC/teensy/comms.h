@@ -111,6 +111,72 @@ volatile char _commResponse[_originLength] = {
 0,0,0,0,0,0,0,0};
 #endif // TEENSY4_0
 
+// Controller metadata state (shared across all Teensy variants)
+static uint8_t _controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
+static uint8_t _metadataNumChunks = 0;
+static bool _metadataLoaded = false;
+static bool _waitingMetaRead = false;
+static uint8_t _metaReadChunkIndex = 0;
+static bool _waitingMetaWrite = false;
+
+// Precomputed serial responses for each metadata chunk (128 bytes per chunk transfer)
+#ifdef TEENSY3_2
+// T3: 2 bits per serial byte => 4 serial bytes per data byte => 128*4 = 512 per chunk
+static const int _metadataChunkResponseLen = METADATA_CHUNK_TRANSFER_SIZE * 4;
+#endif
+#ifdef TEENSY4_0
+// T4: 1 bit per serial byte => 8 serial bytes per data byte => 128*8 = 1024 per chunk
+static const int _metadataChunkResponseLen = METADATA_CHUNK_TRANSFER_SIZE * 8;
+#endif
+static volatile char _metadataChunkResponses[METADATA_MAX_CHUNKS][METADATA_CHUNK_TRANSFER_SIZE * 8]; // max size across platforms
+
+// Precomputed ack response for metadata write (0x01)
+#ifdef TEENSY3_2
+static const char _metadataAck[4] = { 0x08, 0x08, 0x08, 0xE8 };
+static const int _metadataAckLen = 4;
+#endif
+#ifdef TEENSY4_0
+static const char _metadataAck[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
+static const int _metadataAckLen = 8;
+#endif
+
+static void _setMetadataResponses() {
+	for(int c = 0; c < _metadataNumChunks; c++){
+		// Build chunk transfer: [total_chunks, chunk_index, 126 data bytes]
+		uint8_t chunkTransfer[METADATA_CHUNK_TRANSFER_SIZE];
+		chunkTransfer[0] = _metadataNumChunks;
+		chunkTransfer[1] = c;
+		memcpy(&chunkTransfer[2], &_controllerMetadata[c * METADATA_CHUNK_DATA_SIZE], METADATA_CHUNK_DATA_SIZE);
+
+		for(int d = 0; d < METADATA_CHUNK_TRANSFER_SIZE; d++){
+#ifdef TEENSY3_2
+			for(int j = 0; j < 4; j++){
+				int these2bits = (chunkTransfer[d] >> (6 - j*2)) & 3;
+				switch(these2bits){
+					case 0: _metadataChunkResponses[c][d*4+j] = 0x08; break;
+					case 1: _metadataChunkResponses[c][d*4+j] = 0xE8; break;
+					case 2: _metadataChunkResponses[c][d*4+j] = 0x0F; break;
+					case 3: _metadataChunkResponses[c][d*4+j] = 0xEF; break;
+				}
+			}
+#endif
+#ifdef TEENSY4_0
+			for(int j = 0; j < 8; j++){
+				_metadataChunkResponses[c][d*8+j] = (chunkTransfer[d] >> (7-j)) & 1;
+			}
+#endif
+		}
+	}
+}
+
+static void _loadControllerMetadata() {
+	if (!_metadataLoaded) {
+		getControllerMetadata(_controllerMetadata, _metadataNumChunks);
+		_metadataLoaded = true;
+		_setMetadataResponses();
+	}
+}
+
 /*******************
 	setCommResponse
 	takes the values that have been put into the button struct and translates them in the serial commands ready
@@ -264,6 +330,79 @@ void commInt() {
 			//write stop bit to indicate end of response
 			Serial2.write(0xFF);
 		}
+		else if(_waitingMetaRead){
+			//wait for the stop bit to be received after the second command byte
+			while(Serial2.available() <= _bitQueue){}
+
+			//decode chunk index from the second command byte
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < 8; i++){
+				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
+			}
+			Serial2.clear();
+			_waitingMetaRead = false;
+
+			_loadControllerMetadata();
+
+			if(chunkIndex >= _metadataNumChunks) chunkIndex = 0;
+
+			setFastBaud();
+			_writing = true;
+			_bitQueue = _metadataChunkResponseLen / 2;
+
+			//write precomputed metadata chunk response
+			for(int i = 0; i < _metadataChunkResponseLen; i += 2){
+				if(_metadataChunkResponses[chunkIndex][i] != 0 && _metadataChunkResponses[chunkIndex][i+1] != 0) Serial2.write(0xEF);
+				else if(_metadataChunkResponses[chunkIndex][i] == 0 && _metadataChunkResponses[chunkIndex][i+1] != 0) Serial2.write(0xE8);
+				else if(_metadataChunkResponses[chunkIndex][i] != 0 && _metadataChunkResponses[chunkIndex][i+1] == 0) Serial2.write(0x0F);
+				else Serial2.write(0x08);
+			}
+			Serial2.write(0xFF);
+		}
+		else if(_waitingMetaWrite){
+			//wait for all data bytes + stop bit
+			while(Serial2.available() <= _bitQueue){}
+			_waitingMetaWrite = false;
+
+			//decode chunk index from second command byte (8 serial bytes = 1 joybus byte)
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < 8; i++){
+				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
+			}
+
+			//decode 126 data bytes from serial (each bit = 1 serial byte)
+			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
+				uint8_t byte = 0;
+				for(int i = 0; i < 8; i++){
+					byte = (byte << 1) | (Serial2.read() > 0b11110000);
+				}
+				chunkData[d] = byte;
+			}
+			Serial2.clear();
+
+			if(chunkIndex < METADATA_MAX_CHUNKS){
+				_loadControllerMetadata();
+				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
+
+				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				_setMetadataResponses();
+			}
+
+			//send precomputed ack response (0x01)
+			setFastBaud();
+			_writing = true;
+			_bitQueue = _metadataAckLen / 2;
+
+			for(int i = 0; i < _metadataAckLen; i += 2){
+				if(_metadataAck[i] != 0 && _metadataAck[i+1] != 0) Serial2.write(0xEF);
+				else if(_metadataAck[i] == 0 && _metadataAck[i+1] != 0) Serial2.write(0xE8);
+				else if(_metadataAck[i] != 0 && _metadataAck[i+1] == 0) Serial2.write(0x0F);
+				else Serial2.write(0x08);
+			}
+			Serial2.write(0xFF);
+		}
 		else{
 			//We are not writing a response or waiting for a poll response to finish, so we must have received the start of a new command
 			//Set pin 13 (LED) low for debugging, if it flickers it means the teensy got stuck here somewhere
@@ -356,6 +495,16 @@ void commInt() {
 				_bitQueue = 16;
 				setCommResponse(_commResponse, _btn);
 			}
+			//read controller metadata command (0xA0)
+			else if(_cmdByte == 0b10100000){
+				_waitingMetaRead = true;
+				_bitQueue = 8; // 1 more command byte = 8 serial bytes
+			}
+			//write controller metadata command (0xB0)
+			else if(_cmdByte == 0b10110000){
+				_waitingMetaWrite = true;
+				_bitQueue = 8 + METADATA_CHUNK_DATA_SIZE * 8; // 1 index byte + 126 data bytes
+			}
 			//if we got something else then something went wrong, print the command we got and increase the error count
 			else{
 				Serial.print("error: ");
@@ -432,6 +581,78 @@ void commInt() {
 				analogWrite(_pinBrake,256);
 			}
 #endif
+		}
+		else if(_waitingMetaRead){
+			//wait for the stop bit after the second command byte
+			while(Serial2.available() <= _bitQueue){}
+
+			//decode chunk index from the second command byte
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < 8; i++){
+				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
+			}
+			Serial2.clear();
+			_waitingMetaRead = false;
+			_bitQueue = 8;
+
+			_loadControllerMetadata();
+
+			if(chunkIndex >= _metadataNumChunks) chunkIndex = 0;
+
+			setFastBaud();
+
+			//write precomputed metadata chunk response
+			for(int i = 0; i < _metadataChunkResponseLen; i += 2){
+				if(_metadataChunkResponses[chunkIndex][i] != 0 && _metadataChunkResponses[chunkIndex][i+1] != 0) Serial2.write(0xEF);
+				else if(_metadataChunkResponses[chunkIndex][i] == 0 && _metadataChunkResponses[chunkIndex][i+1] != 0) Serial2.write(0xE8);
+				else if(_metadataChunkResponses[chunkIndex][i] != 0 && _metadataChunkResponses[chunkIndex][i+1] == 0) Serial2.write(0x0F);
+				else Serial2.write(0x08);
+			}
+			Serial2.write(0xFF);
+			resetSerial();
+		}
+		else if(_waitingMetaWrite){
+			//wait for all data bytes + stop bit
+			while(Serial2.available() <= _bitQueue){}
+			_waitingMetaWrite = false;
+			_bitQueue = 8;
+
+			//decode chunk index from second command byte
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < 8; i++){
+				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
+			}
+
+			//decode 126 data bytes
+			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
+				uint8_t byte = 0;
+				for(int i = 0; i < 8; i++){
+					byte = (byte << 1) | (Serial2.read() > 0b11110000);
+				}
+				chunkData[d] = byte;
+			}
+			Serial2.clear();
+
+			if(chunkIndex < METADATA_MAX_CHUNKS){
+				_loadControllerMetadata();
+				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
+
+				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				_setMetadataResponses();
+			}
+
+			//send precomputed ack
+			setFastBaud();
+			for(int i = 0; i < _metadataAckLen; i += 2){
+				if(_metadataAck[i] != 0 && _metadataAck[i+1] != 0) Serial2.write(0xEF);
+				else if(_metadataAck[i] == 0 && _metadataAck[i+1] != 0) Serial2.write(0xE8);
+				else if(_metadataAck[i] != 0 && _metadataAck[i+1] == 0) Serial2.write(0x0F);
+				else Serial2.write(0x08);
+			}
+			Serial2.write(0xFF);
+			resetSerial();
 		}
 		else{
 			//We are not writing a response or waiting for a poll response to finish, so we must have received the start of a new command
@@ -521,6 +742,16 @@ void commInt() {
 				_waiting = true;
 				_bitQueue = 16;
 				setCommResponse(_commResponse, _btn);
+			}
+			//read controller metadata command (0xA0)
+			else if(_cmdByte == 0b10100000){
+				_waitingMetaRead = true;
+				_bitQueue = 8; // 1 more command byte
+			}
+			//write controller metadata command (0xB0)
+			else if(_cmdByte == 0b10110000){
+				_waitingMetaWrite = true;
+				_bitQueue = 8 + METADATA_CHUNK_DATA_SIZE * 8; // 1 index byte + 126 data bytes
 			}
 			//if we got something else then something went wrong, print the command we got and increase the error count
 			else{
@@ -653,6 +884,95 @@ void communicate(){
 			//create the poll response
 			setCommResponse(_commResponse, _btn);
 			break;
+
+		//read controller metadata (0xA0)
+		case 0xA0:
+		{
+			//wait for the second command byte (4 serial bytes) + stop bit
+			while(Serial2.available() < _cmdLengthShort){} // _cmdLengthShort = 5 = 4 data + 1 stop
+
+			//decode chunk index from second command byte (T3: 2 bits per serial byte, 4 serial bytes = 1 joybus byte)
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < (_cmdLengthShort - 1); i++){
+				int cmd = Serial2.read();
+				bool bitOne = cmd & 0b00000010;
+				bool bitTwo = cmd & 0b01000000;
+				chunkIndex = (chunkIndex << 1) + bitOne;
+				chunkIndex = (chunkIndex << 1) + bitTwo;
+			}
+			Serial2.clear(); // clear stop bit
+
+			_loadControllerMetadata();
+
+			if(chunkIndex >= _metadataNumChunks) chunkIndex = 0;
+
+			//write precomputed metadata chunk response
+			timer1.trigger(_metadataChunkResponseLen * 8);
+			for(int i = 0; i < _metadataChunkResponseLen; i++){
+				Serial2.write(_metadataChunkResponses[chunkIndex][i]);
+			}
+			Serial2.write(0xFF);
+			_writeQueue = _cmdLengthShort*2-1 + _cmdLengthShort*2-1 + _metadataChunkResponseLen*2 + 1;
+			_commStatus = _commWrite;
+		}
+		break;
+
+		//write controller metadata (0xB0)
+		case 0xB0:
+		{
+			//read second command byte (chunk index) + 126 data bytes
+			//second command byte: 4 serial bytes
+			while(Serial2.available() < _cmdLengthShort){}
+			uint8_t chunkIndex = 0;
+			for(int i = 0; i < (_cmdLengthShort - 1); i++){
+				int cmd = Serial2.read();
+				bool bitOne = cmd & 0b00000010;
+				bool bitTwo = cmd & 0b01000000;
+				chunkIndex = (chunkIndex << 1) + bitOne;
+				chunkIndex = (chunkIndex << 1) + bitTwo;
+			}
+			Serial2.clear(); // clear stop bit from second command byte
+
+			//read 126 data bytes (126 * 4 = 504 serial bytes + stop bit)
+			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
+				int dataByte = 0;
+				for(int i = 0; i < (_cmdLengthShort - 1); i++){
+					while(!Serial2.available());
+					int cmd = Serial2.read();
+					bool bitOne = cmd & 0b00000010;
+					bool bitTwo = cmd & 0b01000000;
+					dataByte = (dataByte << 1) + bitOne;
+					dataByte = (dataByte << 1) + bitTwo;
+				}
+				chunkData[d] = dataByte;
+			}
+			//wait for and clear stop bit
+			while(!Serial2.available());
+			Serial2.clear();
+
+			const int dataSerialLen = METADATA_CHUNK_DATA_SIZE * (_cmdLengthShort - 1); // 126 * 4 = 504
+
+			if(chunkIndex < METADATA_MAX_CHUNKS){
+				_loadControllerMetadata();
+				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
+
+				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				_setMetadataResponses();
+			}
+
+			//send precomputed ack
+			timer1.trigger(_metadataAckLen * 8);
+			for(int i = 0; i < _metadataAckLen; i++){
+				Serial2.write(_metadataAck[i]);
+			}
+			Serial2.write(0xFF);
+			_writeQueue = _cmdLengthShort*2-1 + _cmdLengthShort*2-1 + dataSerialLen*2 + 1 + _metadataAckLen*2 + 1;
+			_commStatus = _commWrite;
+		}
+		break;
+
 		default:
 		  //got something strange, try waiting for a stop bit to syncronize
 			Serial.println("error");

@@ -56,7 +56,33 @@ namespace Eeprom {
 	const int _eepromXRemap = _eepromRRemap+_bytesPerUint8;
 	const int _eepromYRemap = _eepromXRemap+_bytesPerUint8;
 	const int _eepromZRemap = _eepromYRemap+_bytesPerUint8;
-	//const int _nextSetting = _eepromZRemap+bytesPerFloat;
+	const int _eepromControllerMetadataNumChunks = _eepromZRemap+_bytesPerUint8;
+	const int _eepromControllerMetadata = _eepromControllerMetadataNumChunks+_bytesPerUint8;
+	//const int _nextSetting = _eepromControllerMetadata+1008;
+};
+
+#define METADATA_CHUNK_DATA_SIZE 126
+#define METADATA_CHUNK_TRANSFER_SIZE 128
+#define METADATA_MAX_CHUNKS 8
+#define CONTROLLER_METADATA_MAX_SIZE (METADATA_MAX_CHUNKS * METADATA_CHUNK_DATA_SIZE) // 1008
+
+static const uint8_t defaultControllerMetadata[METADATA_CHUNK_DATA_SIZE] = {
+	'P', 'h', 'o', 'b', 'G', 'C', 'C', ' ',
+	'v', '0', '.', '0', '.', '0', '.', '0',
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0
 };
 
 /*
@@ -518,5 +544,34 @@ int getSchemaSetting() {
 void setSchemaSetting(const int schema) {
 	EEPROM.put(Eeprom::_eepromSchema, schema);
 };
+
+void getControllerMetadata(uint8_t *buf, uint8_t &numChunks) {
+	EEPROM.get(Eeprom::_eepromControllerMetadataNumChunks, numChunks);
+	for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
+		EEPROM.get(Eeprom::_eepromControllerMetadata + i, buf[i]);
+	}
+	// Check if EEPROM is blank (all 0xFF) and use defaults if so
+	bool blank = true;
+	for(int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+		if(buf[i] != 0xFF) {
+			blank = false;
+			break;
+		}
+	}
+	if(blank) {
+		numChunks = 1;
+		memcpy(buf, defaultControllerMetadata, METADATA_CHUNK_DATA_SIZE);
+		memset(buf + METADATA_CHUNK_DATA_SIZE, 0, CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
+	} else if(numChunks == 0 || numChunks > METADATA_MAX_CHUNKS) {
+		numChunks = 1;
+	}
+}
+
+void setControllerMetadata(const uint8_t *buf, uint8_t numChunks) {
+	EEPROM.put(Eeprom::_eepromControllerMetadataNumChunks, numChunks);
+	for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
+		EEPROM.put(Eeprom::_eepromControllerMetadata + i, buf[i]);
+	}
+}
 
 #endif //SETTINGS_H
