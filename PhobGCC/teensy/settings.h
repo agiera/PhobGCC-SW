@@ -5,6 +5,7 @@
 
 #include "../common/stick.h"
 #include "../common/structsAndEnums.h"
+#include "../common/phobGCC.h"
 
 //Reimplement all the functions in this header for each platform.
 //Include the appropriate one in each per-board file.
@@ -61,29 +62,13 @@ namespace Eeprom {
 	//const int _nextSetting = _eepromControllerMetadata+1008;
 };
 
-#define METADATA_CHUNK_DATA_SIZE 126
-#define METADATA_CHUNK_TRANSFER_SIZE 128
+#define METADATA_CHUNK_DATA_SIZE 78
+#define METADATA_CHUNK_TRANSFER_SIZE 80
 #define METADATA_MAX_CHUNKS 8
-#define CONTROLLER_METADATA_MAX_SIZE (METADATA_MAX_CHUNKS * METADATA_CHUNK_DATA_SIZE) // 1008
+// total size is 1008
+#define CONTROLLER_METADATA_MAX_SIZE (METADATA_MAX_CHUNKS * METADATA_CHUNK_DATA_SIZE)
 
-static const uint8_t defaultControllerMetadata[METADATA_CHUNK_DATA_SIZE] = {
-	'P', 'h', 'o', 'b', 'G', 'C', 'C', ' ',
-	'v', '0', '.', '0', '.', '0', '.', '0',
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0
-};
+// Default metadata blob is generated at runtime (UBJSON) in getControllerMetadata()
 
 /*
 JumpConfig getJumpSetting() {
@@ -545,33 +530,99 @@ void setSchemaSetting(const int schema) {
 	EEPROM.put(Eeprom::_eepromSchema, schema);
 };
 
-void getControllerMetadata(uint8_t *buf, uint8_t &numChunks) {
-	EEPROM.get(Eeprom::_eepromControllerMetadataNumChunks, numChunks);
-	for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
-		EEPROM.get(Eeprom::_eepromControllerMetadata + i, buf[i]);
-	}
-	// Check if EEPROM is blank (all 0xFF) and use defaults if so
-	bool blank = true;
-	for(int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
-		if(buf[i] != 0xFF) {
-			blank = false;
-			break;
+// Cached metadata (mirrors rp2040 behavior)
+static struct MetadataPage {
+	uint8_t numChunks;
+	uint8_t controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
+} _metadata;
+
+static volatile bool metadataFresh = false;
+// Request from comms to write metadata from main loop to avoid timing hiccups
+extern volatile bool _pleaseCommitMetadata;
+
+static void getMetadataPage() {
+	if(!metadataFresh) {
+		struct TempMeta {
+			uint8_t numChunks;
+			uint8_t controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
+		} temp;
+
+		EEPROM.get(Eeprom::_eepromControllerMetadataNumChunks, temp.numChunks);
+		for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
+			EEPROM.get(Eeprom::_eepromControllerMetadata + i, temp.controllerMetadata[i]);
 		}
+
+		// Check if EEPROM is blank (all 0xFF) and use defaults if so
+		bool blank = true;
+		for(int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+			if(temp.controllerMetadata[i] != 0xFF) {
+				blank = false;
+				break;
+			}
+		}
+		if(blank) {
+			// Build a minimal UBJSON object: { "firmware": "PhobGCC <SW_VERSION>" }
+			uint8_t *p = _metadata.controllerMetadata;
+			int idx = 0;
+			const char *key = "firmware";
+			const char *prefix = "PhobGCC ";
+			char verbuf[16];
+			int vlen = snprintf(verbuf, sizeof(verbuf), "%d", SW_VERSION);
+
+			// Object start
+			p[idx++] = 0x7B; // '{'
+
+			// Key: string marker 'S', length marker 'U' (uint8), length, bytes
+			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
+			memcpy(&p[idx], key, strlen(key)); idx += (int)strlen(key);
+
+			// Value: string marker, length marker, length, bytes
+			int vallen = (int)strlen(prefix) + vlen;
+			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)vallen;
+			memcpy(&p[idx], prefix, strlen(prefix)); idx += (int)strlen(prefix);
+			memcpy(&p[idx], verbuf, vlen); idx += vlen;
+
+			// Object end
+			p[idx++] = 0x7D; // '}'
+
+			// Zero-pad the remainder of the first chunk
+			if (idx < METADATA_CHUNK_DATA_SIZE) {
+				memset(&p[idx], 0, METADATA_CHUNK_DATA_SIZE - idx);
+			}
+			// Clear remaining controller metadata area
+			memset((void*)(_metadata.controllerMetadata + METADATA_CHUNK_DATA_SIZE), 0,
+				   CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
+			_metadata.numChunks = 1;
+		} else {
+			_metadata.numChunks = temp.numChunks;
+			if(_metadata.numChunks == 0 || _metadata.numChunks > METADATA_MAX_CHUNKS) {
+				_metadata.numChunks = 1;
+			}
+			memcpy((void*)_metadata.controllerMetadata, temp.controllerMetadata, CONTROLLER_METADATA_MAX_SIZE);
+		}
+		metadataFresh = true;
 	}
-	if(blank) {
-		numChunks = 1;
-		memcpy(buf, defaultControllerMetadata, METADATA_CHUNK_DATA_SIZE);
-		memset(buf + METADATA_CHUNK_DATA_SIZE, 0, CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
-	} else if(numChunks == 0 || numChunks > METADATA_MAX_CHUNKS) {
-		numChunks = 1;
+}
+
+void getControllerMetadata(uint8_t *buf, uint8_t &numChunks) {
+	getMetadataPage();
+	numChunks = _metadata.numChunks;
+	memcpy(buf, (const void*)_metadata.controllerMetadata, CONTROLLER_METADATA_MAX_SIZE);
+}
+
+void commitMetadata(const bool noLock = false) {
+	EEPROM.put(Eeprom::_eepromControllerMetadataNumChunks, _metadata.numChunks);
+	for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
+		EEPROM.put(Eeprom::_eepromControllerMetadata + i, _metadata.controllerMetadata[i]);
 	}
 }
 
 void setControllerMetadata(const uint8_t *buf, uint8_t numChunks) {
-	EEPROM.put(Eeprom::_eepromControllerMetadataNumChunks, numChunks);
-	for(int i = 0; i < CONTROLLER_METADATA_MAX_SIZE; i++) {
-		EEPROM.put(Eeprom::_eepromControllerMetadata + i, buf[i]);
-	}
+	getMetadataPage();
+	_metadata.numChunks = numChunks;
+	memcpy((void*)_metadata.controllerMetadata, buf, CONTROLLER_METADATA_MAX_SIZE);
+	// Defer actual EEPROM write to main loop to avoid blocking timing-critical comms
+	_pleaseCommitMetadata = true;
 }
 
 #endif //SETTINGS_H

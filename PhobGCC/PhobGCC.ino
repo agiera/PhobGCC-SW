@@ -6,6 +6,14 @@
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
 
+// Flag set by comms to request metadata commit from the main loop
+// Define the flag only for Teensy builds; RP2040 provides its own definition in src/main.cpp
+#if defined(TEENSY3_2) || defined(TEENSY4_0)
+volatile bool _pleaseCommitMetadata = false;
+#else
+extern volatile bool _pleaseCommitMetadata;
+#endif
+
 void setup() {
     serialSetup();
 	Serial.print("Software version 0.");
@@ -51,6 +59,14 @@ void setup() {
 }
 
 void loop() {
+	// Metadata commit request from comms handler (deferred write)
+	extern volatile bool _pleaseCommitMetadata;
+
+	if(_pleaseCommitMetadata) {
+		_pleaseCommitMetadata = false;
+		commitMetadata();
+	}
+
 	static bool running = false;
 
 	//check if we should be reporting values yet

@@ -9,16 +9,8 @@
 #define METADATA_MAX_CHUNKS 8
 #define CONTROLLER_METADATA_MAX_SIZE (METADATA_MAX_CHUNKS * METADATA_CHUNK_DATA_SIZE) // 1008
 
-static const uint8_t defaultControllerMetadata[METADATA_CHUNK_DATA_SIZE] = {
-    'P', 'h', 'o', 'b', 'G', 'C', 'C', ' ',
-    'v', '0', '.', '0', '.', '0', '.', '0',
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0
-};
+// Default metadata blob is generated at runtime (UBJSON)
+// in storage.cpp's getMetadataPage()
 
 namespace Persistence {
 namespace Pages {
@@ -36,10 +28,5 @@ struct Metadata {
 void getControllerMetadata(uint8_t *buf, uint8_t &numChunks);
 void setControllerMetadata(const uint8_t *buf, uint8_t numChunks);
 void commitMetadata(const bool noLock = false);
-
-// Calibration transfer over SI (chunked like metadata)
-void getCalibrationData(uint8_t *buf, uint8_t &numChunks);
-void setCalibrationData(const uint8_t *buf, uint8_t numChunks);
-void commitCalibration(const bool noLock = false);
 
 #endif //METADATA_H

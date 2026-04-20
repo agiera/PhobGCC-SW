@@ -1,6 +1,7 @@
 #include "storage/pages/storage.h"
 #include "storage/pages/metadata.h"
 #include "storage/functions.hpp"
+#include "phobGCC.h"
 
 static volatile Persistence::Pages::Storage _storage;
 static volatile bool fresh = false;
@@ -492,10 +493,39 @@ static void getMetadataPage() {
 			}
 		}
 		if(blank) {
-			_metadata.numChunks = 1;
-			memcpy((void*)_metadata.controllerMetadata, defaultControllerMetadata, METADATA_CHUNK_DATA_SIZE);
+			// Build a minimal UBJSON object: { "firmware": "PhobGCC <SW_VERSION>" }
+			// UBJSON form used: { S U <len_key> <key_bytes> S U <len_val> <val_bytes> }
+			uint8_t *p = (uint8_t*)_metadata.controllerMetadata;
+			int idx = 0;
+			const char *key = "firmware";
+			const char *prefix = "PhobGCC ";
+			char verbuf[16];
+			int vlen = snprintf(verbuf, sizeof(verbuf), "%d", SW_VERSION);
+
+			// Object start
+			p[idx++] = 0x7B; // '{'
+
+			// Key: string marker 'S', length marker 'U' (uint8), length, bytes
+			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
+			memcpy(&p[idx], key, strlen(key)); idx += (int)strlen(key);
+
+			// Value: string marker, length marker, length, bytes
+			int vallen = (int)strlen(prefix) + vlen;
+			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)vallen;
+			memcpy(&p[idx], prefix, strlen(prefix)); idx += (int)strlen(prefix);
+			memcpy(&p[idx], verbuf, vlen); idx += vlen;
+
+			// Object end
+			p[idx++] = 0x7D; // '}'
+
+			// Zero-pad the remainder of the first chunk
+			if (idx < METADATA_CHUNK_DATA_SIZE) {
+				memset(&p[idx], 0, METADATA_CHUNK_DATA_SIZE - idx);
+			}
+			// Clear remaining controller metadata area
 			memset((void*)(_metadata.controllerMetadata + METADATA_CHUNK_DATA_SIZE), 0,
-			       CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
+				   CONTROLLER_METADATA_MAX_SIZE - METADATA_CHUNK_DATA_SIZE);
+			_metadata.numChunks = 1;
 		} else {
 			_metadata.numChunks = temp.numChunks;
 			if(_metadata.numChunks == 0 || _metadata.numChunks > METADATA_MAX_CHUNKS) {
