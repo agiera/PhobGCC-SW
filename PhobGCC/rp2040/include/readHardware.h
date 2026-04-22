@@ -9,6 +9,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
+#include "hardware/pwm.h"
 #include "hardware/spi.h"
 #include "hardware/timer.h"
 

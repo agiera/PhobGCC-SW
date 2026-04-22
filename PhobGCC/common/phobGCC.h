@@ -25,12 +25,10 @@ using std::max;
 #include "filter.h"
 #include "stick.h"
 #include "../extras/extras.h"
+#include "version.h"
 
 #define BUILD_RELEASE
 //#define BUILD_DEV
-
-//This is just an integer.
-#define SW_VERSION 31
 
 ControlConfig _controls{
 	.aRemap = 1 << A_REMAP,

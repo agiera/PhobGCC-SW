@@ -1,7 +1,10 @@
 #include "storage/pages/storage.h"
 #include "storage/pages/metadata.h"
 #include "storage/functions.hpp"
-#include "phobGCC.h"
+#include <cstdio>
+#include <cstring>
+
+#include "version.h"
 
 static volatile Persistence::Pages::Storage _storage;
 static volatile bool fresh = false;
