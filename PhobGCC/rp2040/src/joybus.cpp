@@ -162,10 +162,33 @@ struct JoybusCtx {
     uint sm;
     uint offset;
     pio_sm_config config;
+    // Per-byte read timeout. 0 means block forever (the default — used by
+    // normal SI mode where console timing is reliable). Video mode sets
+    // this to ~half a frame so a malformed command can't wedge the
+    // joybus service loop.
+    uint32_t timeoutUs = 0;
+    // Set by jbRead() when a read times out. Subsequent reads no-op and
+    // return 0, so handlers can read freely and check this flag once
+    // before transmitting. Cleared by dispatchCommand() per command.
+    bool timedOut = false;
 };
 
-static inline uint8_t jbReadBlocking(JoybusCtx* ctx) {
-    return (uint8_t)pio_sm_get_blocking(ctx->pio, ctx->sm);
+// Read one byte. On timeout, sets ctx->timedOut and returns 0. Once
+// timedOut is set, further reads are no-ops returning 0 — this lets
+// handlers cascade reads without per-call error checks.
+static inline uint8_t jbRead(JoybusCtx* ctx) {
+    if (ctx->timedOut) return 0;
+    if (ctx->timeoutUs == 0) {
+        return (uint8_t)pio_sm_get_blocking(ctx->pio, ctx->sm);
+    }
+    const uint64_t deadline = time_us_64() + ctx->timeoutUs;
+    while (pio_sm_is_rx_fifo_empty(ctx->pio, ctx->sm)) {
+        if (time_us_64() >= deadline) {
+            ctx->timedOut = true;
+            return 0;
+        }
+    }
+    return (uint8_t)pio_sm_get(ctx->pio, ctx->sm);
 }
 
 static inline void jbSwitchToOut(JoybusCtx* ctx) {
@@ -207,19 +230,20 @@ static void handleOrigin(JoybusCtx* ctx) {
 }
 
 // Poll: reads mode byte, builds report via callback, reads rumble byte,
-// sends the 8-byte controller state. Returns the rumble byte so the caller
-// can drive rumble hardware if it has any.
+// sends the 8-byte controller state. Returns the rumble byte; on timeout
+// returns 0 and the dispatcher's timedOut check skips rumble side-effects.
 static uint8_t handlePoll(JoybusCtx* ctx, std::function<GCReport()>& func) {
     GCReport gcReport = func();
     GCReport dest;
 
-    uint8_t mode = jbReadBlocking(ctx);
+    uint8_t mode = jbRead(ctx);
     convertGCReport(&gcReport, &dest, mode);
 
     uint32_t w[5]; int wl;
     convertToPio((uint8_t*)&dest, 8, w, wl);
 
-    uint8_t rumbleByte = jbReadBlocking(ctx);
+    uint8_t rumbleByte = jbRead(ctx);
+    if (ctx->timedOut) { jbSwitchToIn(ctx); return 0; }
 
     sleep_us(7); // don't overwrite the stop bit of the poll command
     jbSwitchToOut(ctx);
@@ -228,7 +252,8 @@ static uint8_t handlePoll(JoybusCtx* ctx, std::function<GCReport()>& func) {
 }
 
 static void handleMetadataRead(JoybusCtx* ctx) {
-    uint8_t chunkIndex = jbReadBlocking(ctx);
+    uint8_t chunkIndex = jbRead(ctx);
+    if (ctx->timedOut) { jbSwitchToIn(ctx); return; }
     if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
     sleep_us(7);
     jbSwitchToOut(ctx);
@@ -236,11 +261,12 @@ static void handleMetadataRead(JoybusCtx* ctx) {
 }
 
 static void handleMetadataWrite(JoybusCtx* ctx) {
-    uint8_t chunkIndex = jbReadBlocking(ctx);
+    uint8_t chunkIndex = jbRead(ctx);
     uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
     for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
-        chunkData[i] = jbReadBlocking(ctx);
+        chunkData[i] = jbRead(ctx);
     }
+    if (ctx->timedOut) { jbSwitchToIn(ctx); return; }
     if (chunkIndex < METADATA_MAX_CHUNKS) {
         // Writing chunk 0 starts a new sequence — reset count so stale
         // chunks from a previous (larger) write are discarded.
@@ -257,7 +283,8 @@ static void handleMetadataWrite(JoybusCtx* ctx) {
 }
 
 static void handleDisplayListRead(JoybusCtx* ctx) {
-    uint8_t chunkIndex = jbReadBlocking(ctx);
+    uint8_t chunkIndex = jbRead(ctx);
+    if (ctx->timedOut) { jbSwitchToIn(ctx); return; }
     uint8_t n = displayListNumChunks;
     if (n == 0) {
         // No display list built yet. Drop back to input to avoid leaving PIO
@@ -287,11 +314,13 @@ static void dispatchCommand(JoybusCtx* ctx,
                             int rumblePin,
                             int brakePin,
                             int rumblePower) {
+    ctx->timedOut = false;
     switch (cmd) {
         case 0x00: handleProbe(ctx); break;
         case 0x41: handleOrigin(ctx); break;
         case 0x40: {
             uint8_t rumbleByte = handlePoll(ctx, func);
+            if (ctx->timedOut) break;
             if (rumblePin >= 0) {
                 bool rumbleBrake = rumbleByte & 2;
                 bool rumble = (rumbleByte & 1) && !rumbleBrake;
@@ -366,6 +395,7 @@ void __time_critical_func(enterMode)(const int dataPin,
     JoybusCtx ctx;
     ctx.pio = pio0;
     ctx.sm = 0;
+    // ctx.timeoutUs defaults to 0 (block forever).
 
     pio_gpio_init(ctx.pio, dataPin);
     ctx.offset = pio_add_program(ctx.pio, &joybus_program);
@@ -415,6 +445,10 @@ void initJoybusForVideoMode(int dataPin) {
 
     _videoCtx.pio = pio1;
     _videoCtx.sm = 0;
+    // Half a 60Hz frame. Long enough to absorb the ~36 µs gap between bytes
+    // of any well-formed multi-byte command, short enough that an aborted
+    // command can never wedge the joybus service loop for more than ~8ms.
+    _videoCtx.timeoutUs = 8333;
 
     pio_gpio_init(_videoCtx.pio, dataPin);
     gpio_set_dir(dataPin, GPIO_IN);
