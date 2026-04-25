@@ -6,10 +6,18 @@
 #include "hardware/pio.h"
 #include "joybus.pio.h"
 #include "storage/pages/metadata.h"
+#include "displayList.h"
 #include <string.h>
 #include <math.h>
 
 #define ORG 127
+
+// --- Display-list transfer layout (0xC0 read command) ---
+// Each 80-byte transfer: [0]=numChunks, [1]=chunkIndex, [2..79]=78 bytes of DL data.
+#define DISPLAY_LIST_CHUNK_DATA_SIZE     78
+#define DISPLAY_LIST_CHUNK_TRANSFER_SIZE 80
+#define DISPLAY_LIST_MAX_BYTES           4096
+#define DISPLAY_LIST_MAX_CHUNKS ((DISPLAY_LIST_MAX_BYTES + DISPLAY_LIST_CHUNK_DATA_SIZE - 1) / DISPLAY_LIST_CHUNK_DATA_SIZE)
 
 static uint8_t controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
 static uint8_t metadataNumChunks = 0;
@@ -20,6 +28,13 @@ static uint32_t metadataPioChunks[METADATA_MAX_CHUNKS][METADATA_CHUNK_TRANSFER_S
 static int metadataPioChunkLens[METADATA_MAX_CHUNKS];
 static uint32_t metadataAckPioResult[2];
 static int metadataAckPioResultLen;
+
+// Precomputed PIO responses for each display-list chunk.
+// Rebuilt on core 0 after each draw by precomputeDisplayListChunks();
+// read on either core by handleDisplayListRead().
+static uint32_t displayListPioChunks[DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE / 2 + 1];
+static int displayListPioChunkLens[DISPLAY_LIST_MAX_CHUNKS];
+static volatile uint8_t displayListNumChunks = 0;
 
 extern volatile bool _pleaseCommitMetadata;
 
@@ -128,6 +143,215 @@ void __time_critical_func(convertGCReport)(GCReport* report, GCReport* dest_repo
     }
 }
 
+// ============================================================
+// Shared joybus command handlers.
+//
+// Each handler assumes the command byte has already been consumed from the
+// PIO RX FIFO, and the state machine is still in input (`inmode`). Handlers
+// switch to output, send their response, and rely on `convertToPio`'s
+// trailing zero bits to make the PIO auto-return to `inmode` (via the
+// `jmp !Y inmode` at the end of the outmode program).
+//
+// The same handlers are used by two callers:
+//   - enterMode()                  normal SI mode on PIO0
+//   - serviceJoybusForVideoMode()  video-mode side channel on PIO1
+// ============================================================
+
+struct JoybusCtx {
+    PIO pio;
+    uint sm;
+    uint offset;
+    pio_sm_config config;
+};
+
+static inline uint8_t jbReadBlocking(JoybusCtx* ctx) {
+    return (uint8_t)pio_sm_get_blocking(ctx->pio, ctx->sm);
+}
+
+static inline void jbSwitchToOut(JoybusCtx* ctx) {
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_init(ctx->pio, ctx->sm, ctx->offset + joybus_offset_outmode, &ctx->config);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
+}
+
+static inline void jbSwitchToIn(JoybusCtx* ctx) {
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_init(ctx->pio, ctx->sm, ctx->offset + joybus_offset_inmode, &ctx->config);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
+}
+
+static inline void jbPut(JoybusCtx* ctx, const uint32_t* words, int len) {
+    for (int i = 0; i < len; i++) {
+        pio_sm_put_blocking(ctx->pio, ctx->sm, words[i]);
+    }
+}
+
+// --- Handlers ---------------------------------------------------------------
+
+static void handleProbe(JoybusCtx* ctx) {
+    uint8_t resp[3] = { 0x09, 0x00, 0x03 };
+    uint32_t w[2]; int wl;
+    convertToPio(resp, 3, w, wl);
+    sleep_us(6); // wait out trailing stop bit before driving the line
+    jbSwitchToOut(ctx);
+    jbPut(ctx, w, wl);
+}
+
+static void handleOrigin(JoybusCtx* ctx) {
+    uint8_t resp[10] = { 0x00, 0x80, ORG, ORG, ORG, ORG, 0, 0, 0, 0 };
+    uint32_t w[6]; int wl;
+    convertToPio(resp, 10, w, wl);
+    // convertToPio took time; no explicit sleep needed.
+    jbSwitchToOut(ctx);
+    jbPut(ctx, w, wl);
+}
+
+// Poll: reads mode byte, builds report via callback, reads rumble byte,
+// sends the 8-byte controller state. Returns the rumble byte so the caller
+// can drive rumble hardware if it has any.
+static uint8_t handlePoll(JoybusCtx* ctx, std::function<GCReport()>& func) {
+    GCReport gcReport = func();
+    GCReport dest;
+
+    uint8_t mode = jbReadBlocking(ctx);
+    convertGCReport(&gcReport, &dest, mode);
+
+    uint32_t w[5]; int wl;
+    convertToPio((uint8_t*)&dest, 8, w, wl);
+
+    uint8_t rumbleByte = jbReadBlocking(ctx);
+
+    sleep_us(7); // don't overwrite the stop bit of the poll command
+    jbSwitchToOut(ctx);
+    jbPut(ctx, w, wl);
+    return rumbleByte;
+}
+
+static void handleMetadataRead(JoybusCtx* ctx) {
+    uint8_t chunkIndex = jbReadBlocking(ctx);
+    if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
+    sleep_us(7);
+    jbSwitchToOut(ctx);
+    jbPut(ctx, metadataPioChunks[chunkIndex], metadataPioChunkLens[chunkIndex]);
+}
+
+static void handleMetadataWrite(JoybusCtx* ctx) {
+    uint8_t chunkIndex = jbReadBlocking(ctx);
+    uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+    for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+        chunkData[i] = jbReadBlocking(ctx);
+    }
+    if (chunkIndex < METADATA_MAX_CHUNKS) {
+        // Writing chunk 0 starts a new sequence — reset count so stale
+        // chunks from a previous (larger) write are discarded.
+        if (chunkIndex == 0) metadataNumChunks = 0;
+        memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+        if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
+        precomputeMetadataResponses();
+        setControllerMetadata(controllerMetadata, metadataNumChunks);
+        _pleaseCommitMetadata = true;
+    }
+    sleep_us(7);
+    jbSwitchToOut(ctx);
+    jbPut(ctx, metadataAckPioResult, metadataAckPioResultLen);
+}
+
+static void handleDisplayListRead(JoybusCtx* ctx) {
+    uint8_t chunkIndex = jbReadBlocking(ctx);
+    uint8_t n = displayListNumChunks;
+    if (n == 0) {
+        // No display list built yet. Drop back to input to avoid leaving PIO
+        // stuck in output mode with an empty FIFO.
+        sleep_us(7);
+        jbSwitchToIn(ctx);
+        return;
+    }
+    if (chunkIndex >= n) chunkIndex = 0;
+    sleep_us(7);
+    jbSwitchToOut(ctx);
+    jbPut(ctx, displayListPioChunks[chunkIndex], displayListPioChunkLens[chunkIndex]);
+}
+
+static void handleUnknown(JoybusCtx* ctx) {
+    // Unknown command — wait for it to finish then reset to input.
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    sleep_us(400);
+    pio_sm_init(ctx->pio, ctx->sm, ctx->offset + joybus_offset_inmode, &ctx->config);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
+}
+
+// Dispatch a fully-received command byte. Optional rumble pins (<0 to skip).
+static void dispatchCommand(JoybusCtx* ctx,
+                            uint8_t cmd,
+                            std::function<GCReport()>& func,
+                            int rumblePin,
+                            int brakePin,
+                            int rumblePower) {
+    switch (cmd) {
+        case 0x00: handleProbe(ctx); break;
+        case 0x41: handleOrigin(ctx); break;
+        case 0x40: {
+            uint8_t rumbleByte = handlePoll(ctx, func);
+            if (rumblePin >= 0) {
+                bool rumbleBrake = rumbleByte & 2;
+                bool rumble = (rumbleByte & 1) && !rumbleBrake;
+                if (rumble) {
+                    pwm_set_gpio_level(brakePin, 0);
+                    pwm_set_gpio_level(rumblePin, rumblePower);
+                } else {
+                    pwm_set_gpio_level(rumblePin, 0);
+                    pwm_set_gpio_level(brakePin, rumbleBrake ? 255 : 0);
+                }
+            }
+            break;
+        }
+        case 0xA0: handleMetadataRead(ctx); break;
+        case 0xB0: handleMetadataWrite(ctx); break;
+        case 0xC0: handleDisplayListRead(ctx); break;
+        default:   handleUnknown(ctx); break;
+    }
+}
+
+// ============================================================
+// Public: display-list chunk precompute
+// Called after each frame's draw completes. Builds PIO-ready transfer words
+// from the current displayList buffer so the 0xC0 handler can respond with
+// zero work in the hot path.
+// ============================================================
+
+void precomputeDisplayListChunks() {
+    const uint8_t* data = displayListGetData();
+    uint16_t size = displayListGetSize();
+
+    uint8_t nChunks = (uint8_t)((size + DISPLAY_LIST_CHUNK_DATA_SIZE - 1) / DISPLAY_LIST_CHUNK_DATA_SIZE);
+    if (nChunks == 0) nChunks = 1;
+    if (nChunks > DISPLAY_LIST_MAX_CHUNKS) nChunks = DISPLAY_LIST_MAX_CHUNKS;
+
+    for (uint8_t c = 0; c < nChunks; c++) {
+        uint8_t buf[DISPLAY_LIST_CHUNK_TRANSFER_SIZE];
+        buf[0] = nChunks;
+        buf[1] = c;
+        uint16_t off = (uint16_t)c * DISPLAY_LIST_CHUNK_DATA_SIZE;
+        uint16_t remaining = (size > off) ? (uint16_t)(size - off) : 0;
+        uint16_t copy = (remaining < DISPLAY_LIST_CHUNK_DATA_SIZE) ? remaining : DISPLAY_LIST_CHUNK_DATA_SIZE;
+        if (copy > 0) {
+            memcpy(&buf[2], &data[off], copy);
+        }
+        if (copy < DISPLAY_LIST_CHUNK_DATA_SIZE) {
+            memset(&buf[2 + copy], 0, DISPLAY_LIST_CHUNK_DATA_SIZE - copy);
+        }
+        convertToPio(buf, DISPLAY_LIST_CHUNK_TRANSFER_SIZE,
+                     displayListPioChunks[c], displayListPioChunkLens[c]);
+    }
+
+    // Publish the new chunk count last so readers never see a mismatch.
+    displayListNumChunks = nChunks;
+}
+
+// ============================================================
+// Normal SI mode (PIO0, console/adapter as master)
+// ============================================================
+
 void __time_critical_func(enterMode)(const int dataPin,
                                      const int rumblePin,
                                      const int brakePin,
@@ -139,142 +363,98 @@ void __time_critical_func(enterMode)(const int dataPin,
 
     sleep_us(100); // Stabilize voltages
 
-    PIO pio = pio0;
-    pio_gpio_init(pio, dataPin);
-    uint offset = pio_add_program(pio, &joybus_program);
+    JoybusCtx ctx;
+    ctx.pio = pio0;
+    ctx.sm = 0;
 
-    pio_sm_config config = joybus_program_get_default_config(offset);
-    sm_config_set_in_pins(&config, dataPin);
-    sm_config_set_out_pins(&config, dataPin, 1);
-    sm_config_set_set_pins(&config, dataPin, 1);
-    sm_config_set_clkdiv(&config, 5);
-    sm_config_set_out_shift(&config, true, false, 32);
-    sm_config_set_in_shift(&config, false, true, 8);
-    
-    pio_sm_init(pio, 0, offset, &config);
-    pio_sm_set_enabled(pio, 0, true);
-    
+    pio_gpio_init(ctx.pio, dataPin);
+    ctx.offset = pio_add_program(ctx.pio, &joybus_program);
+
+    ctx.config = joybus_program_get_default_config(ctx.offset);
+    sm_config_set_in_pins(&ctx.config, dataPin);
+    sm_config_set_out_pins(&ctx.config, dataPin, 1);
+    sm_config_set_set_pins(&ctx.config, dataPin, 1);
+    sm_config_set_clkdiv(&ctx.config, 5); // 125 MHz sys / 5 = 25 MHz PIO
+    sm_config_set_out_shift(&ctx.config, true, false, 32);
+    sm_config_set_in_shift(&ctx.config, false, true, 8);
+
+    pio_sm_init(ctx.pio, ctx.sm, ctx.offset, &ctx.config);
+    pio_sm_set_enabled(ctx.pio, ctx.sm, true);
+
     loadControllerMetadata();
 
     while (true) {
-		uint8_t joybusByte = pio_sm_get_blocking(pio, 0);
-
-        if (joybusByte == 0) { // Probe
-            uint8_t probeResponse[3] = { 0x09, 0x00, 0x03 };
-            uint32_t result[2];
-            int resultLen;
-            convertToPio(probeResponse, 3, result, resultLen);
-            sleep_us(6); // 3.75us into the bit before end bit => 6.25 to wait if the end-bit is 5us long
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
-            for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
-        }
-        else if (joybusByte == 0x41) { // Origin (NOT 0x81)
-            gpio_put(25, 1);
-            uint8_t originResponse[10] = { 0x00, 0x80, ORG, ORG, ORG, ORG, 0, 0, 0, 0 };
-            // TODO The origin response sends centered values in this code excerpt. Consider whether that makes sense for your project (digital controllers -> yes)
-            uint32_t result[6];
-            int resultLen;
-            convertToPio(originResponse, 10, result, resultLen);
-            // Here we don't wait because convertToPio takes time
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
-            for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
-        }
-        else if (joybusByte == 0x40) { // Could check values past the first byte for reliability
-            //The call to the state building function happens here, because on digital controllers, it's near instant, so it can be done between the poll and the response
-            // It must be very fast (few us max) to be done between poll and response and still be compatible with adapters
-            // Consider whether that makes sense for your project. If your state building is long, use a different control flow i.e precompute somehow and have func read it
-            GCReport gcReport = func();
-            GCReport dest_report;
-
-			//get the second byte; we do this interleaved with work that must be done
-            joybusByte = pio_sm_get_blocking(pio, 0);
-
-            convertGCReport(&gcReport, &dest_report, joybusByte);
-
-            uint32_t result[5];
-            int resultLen;
-            convertToPio((uint8_t*)(&dest_report), 8, result, resultLen);
-
-			//get the third byte; we do this interleaved with work that must be done
-            joybusByte = pio_sm_get_blocking(pio, 0);
-
-			//sleep_us(4);//add delay so we don't overwrite the stop bit
-			sleep_us(7);//add delay so we don't overwrite the stop bit
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
-            for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
-
-			//Rumble
-			bool rumbleBrake = joybusByte & 2;
-			bool rumble = (joybusByte & 1) && !rumbleBrake;
-            if(rumble) {
-                pwm_set_gpio_level(brakePin, 0);
-                pwm_set_gpio_level(rumblePin, rumblePower);
-            } else {
-                pwm_set_gpio_level(rumblePin, 0);
-                pwm_set_gpio_level(brakePin, rumbleBrake ? 255 : 0);
-            }
-
-        }
-        else if (joybusByte == 0xA0) { // Read controller metadata chunk
-            uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
-
-            if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
-
-            sleep_us(7);
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
-            for (int i = 0; i<metadataPioChunkLens[chunkIndex]; i++) pio_sm_put_blocking(pio, 0, metadataPioChunks[chunkIndex][i]);
-        }
-        else if (joybusByte == 0xB0) { // Write controller metadata chunk
-            uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
-
-            uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
-            for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
-                chunkData[i] = pio_sm_get_blocking(pio, 0);
-            }
-
-            bool validChunk = chunkIndex < METADATA_MAX_CHUNKS;
-            if (validChunk) {
-                // Writing chunk 0 starts a new write sequence — reset count
-                // so stale chunks from a previous (larger) write are discarded.
-                if (chunkIndex == 0) metadataNumChunks = 0;
-                memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-                if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
-                precomputeMetadataResponses();
-                setControllerMetadata(controllerMetadata, metadataNumChunks);
-                _pleaseCommitMetadata = true;
-            }
-
-            sleep_us(7);
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
-            for (int i = 0; i<metadataAckPioResultLen; i++) pio_sm_put_blocking(pio, 0, metadataAckPioResult[i]);
-        }
-        else {
-            pio_sm_set_enabled(pio, 0, false);
-            sleep_us(400);
-            //If an unmatched communication happens, we wait for 400us for it to finish for sure before starting to listen again
-            pio_sm_init(pio, 0, offset+joybus_offset_inmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-        }
+        uint8_t cmd = pio_sm_get_blocking(ctx.pio, ctx.sm);
+        dispatchCommand(&ctx, cmd, func, rumblePin, brakePin, rumblePower);
     }
 }
 
+// ============================================================
+// Video mode side channel (PIO1)
+// PIO0 is occupied by composite video. System clock is 250 MHz in video
+// mode, so clkdiv = 10 gives the same 25 MHz PIO clock the protocol
+// timings assume.
+// ============================================================
+
+static JoybusCtx _videoCtx;
+static bool _videoInited = false;
+// Placeholder callback used when the video-mode caller doesn't provide one.
+// Returns a neutral controller state so polls get a valid response.
+static GCReport videoDefaultReport() {
+    GCReport r{};
+    r.pad1 = 1;
+    r.xStick = ORG;
+    r.yStick = ORG;
+    r.cxStick = ORG;
+    r.cyStick = ORG;
+    return r;
+}
+
+void initJoybusForVideoMode(int dataPin) {
+    if (_videoInited) return;
+
+    _videoCtx.pio = pio1;
+    _videoCtx.sm = 0;
+
+    pio_gpio_init(_videoCtx.pio, dataPin);
+    gpio_set_dir(dataPin, GPIO_IN);
+    gpio_pull_up(dataPin);
+    sleep_us(100);
+
+    _videoCtx.offset = pio_add_program(_videoCtx.pio, &joybus_program);
+    _videoCtx.config = joybus_program_get_default_config(_videoCtx.offset);
+    sm_config_set_in_pins(&_videoCtx.config, dataPin);
+    sm_config_set_out_pins(&_videoCtx.config, dataPin, 1);
+    sm_config_set_set_pins(&_videoCtx.config, dataPin, 1);
+    sm_config_set_clkdiv(&_videoCtx.config, 10); // 250 MHz sys / 10 = 25 MHz PIO
+    sm_config_set_out_shift(&_videoCtx.config, true, false, 32);
+    sm_config_set_in_shift(&_videoCtx.config, false, true, 8);
+
+    pio_sm_init(_videoCtx.pio, _videoCtx.sm, _videoCtx.offset, &_videoCtx.config);
+    pio_sm_set_enabled(_videoCtx.pio, _videoCtx.sm, true);
+
+    loadControllerMetadata();
+
+    // Flush any bytes that arrived during the (slow) init sequence so the
+    // first service call isn't processing garbage.
+    pio_sm_clear_fifos(_videoCtx.pio, _videoCtx.sm);
+
+    _videoInited = true;
+}
+
+// Non-blocking: service one command if the RX FIFO has data. Intended to
+// be called in a tight loop from core 1 while core 0 renders video.
+// `reportFn` may be null to use a neutral default response.
+void serviceJoybusForVideoMode(std::function<GCReport()> reportFn) {
+    if (!_videoInited) return;
+    if (pio_sm_is_rx_fifo_empty(_videoCtx.pio, _videoCtx.sm)) return;
+
+    uint8_t cmd = (uint8_t)pio_sm_get(_videoCtx.pio, _videoCtx.sm);
+
+    if (!reportFn) {
+        std::function<GCReport()> dflt = videoDefaultReport;
+        dispatchCommand(&_videoCtx, cmd, dflt, -1, -1, 0);
+    } else {
+        dispatchCommand(&_videoCtx, cmd, reportFn, -1, -1, 0);
+    }
+}
