@@ -1,4 +1,5 @@
 #include "cvideo.h"
+#include "displayList.h"
 
 /* Decode runlength encoded images of the following format:
  * unsigned char image[]:
@@ -26,7 +27,8 @@ void drawImage(unsigned char bitmap[],
                const unsigned char image[],
                const unsigned char index[8],
                const uint16_t x,
-               const uint16_t y) {
+               const uint16_t y,
+               const uint32_t imageId) {
 	uint32_t imgWidth = getImageWidth(image);
 	uint32_t imgHeight = getImageHeight(image);
 	uint32_t pixelCount = imgWidth * imgHeight;
@@ -37,6 +39,8 @@ void drawImage(unsigned char bitmap[],
 		//don't draw images that will go out of bounds
 		return;
 	}
+
+	displayListRecordImageRef(x, y, (uint16_t)imgWidth, (uint16_t)imgHeight, imageId);
 
 	//starting byte for decoding the run length encoding
 	uint32_t byte = 4;

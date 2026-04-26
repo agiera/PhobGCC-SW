@@ -55,6 +55,8 @@ void cvideo_dma_handler(void);
 #include "cvideo.h"
 #include "cvideo_variables.h"
 #include "games/ping.h"
+#include "displayList.h"
+#include "comms/joybus.hpp"
 
 
 /*-------------------------------------------------------------------*/
@@ -195,15 +197,25 @@ int videoOut(const uint8_t pin_base,
 	cvideo_dma_handler();
 	pio_sm_set_enabled(pio, state_machine, true);           // Enable the PIO state machine
 
+	// Bring up the SI side-channel on PIO1 so that a host (e.g. a Mayflash
+	// adapter) can poll the controller and request the vector display list
+	// (0xC0) over the same SI line while composite video is still being
+	// driven on PIO0. This does not affect TRS video output.
+	// Hardcoded to GPIO 28 (SI/_pinTX); we don't include the board header
+	// here because readHardware.h defines non-inline functions.
+	initJoybusForVideoMode(28);
+
 	unsigned int menuIndex = 0;;
 	int itemIndex = 0;;
 	uint8_t redraw = 1;//start off with a normal redraw
 	bool changeMade = false;
 
 	while (true) {
-		//tight_loop_contents();
 		while(!_startSync) {
-			tight_loop_contents();
+			// Service the SI side-channel while waiting for the next vsync.
+			// This is non-blocking; it returns immediately if no command is
+			// pending.
+			serviceJoybusForVideoMode(nullptr);
 		}
 		extSync = true;
 		_startSync = false;
@@ -226,14 +238,21 @@ int videoOut(const uint8_t pin_base,
 			handleMenuButtons(_bitmap, menuIndex, itemIndex, redraw, changeMade, currentCalStep, currentRemapStep, pleaseCommit, btn, hardware, config, capture);
 
 			if(redraw == 2) { //fast redraw
+				displayListBeginFrame(VWIDTH, VHEIGHT, redraw);
 				redraw = 0;
 				drawMenuFast(_bitmap, menuIndex, itemIndex, changeMade, currentCalStep, currentRemapStep, btn, hardware, raw, config, aStick, cStick);
+				displayListEndFrame();
+				precomputeDisplayListChunks();
 			} else if(redraw == 1) { //slow redraw
+				displayListBeginFrame(VWIDTH, VHEIGHT, redraw);
 				redraw = 0;
 				//write interlace offset
 				_interlaceOffset = config.interlaceOffset;
 				memset(_bitmap, BLACK2, BUFFERLEN);
+				displayListRecordClear(BLACK2);
 				drawMenu(_bitmap, menuIndex, itemIndex, changeMade, currentCalStep, currentRemapStep, version, btn, raw, config, aStick, cStick, capture);
+				displayListEndFrame();
+				precomputeDisplayListChunks();
 			}
 		}
 	}

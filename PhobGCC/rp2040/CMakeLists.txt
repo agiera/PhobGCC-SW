@@ -19,6 +19,7 @@ add_executable(phobgcc_rp2040
 	src/drawGraphics.cpp
 	src/drawImage.cpp
 	src/drawMenu.cpp
+	src/displayList.cpp
 	src/graph.cpp
 	src/joybus.cpp
 	src/main.cpp

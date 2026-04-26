@@ -37,11 +37,26 @@ int videoOut(const uint8_t pin_base,
 
 uint16_t getImageWidth(const unsigned char image[]);
 uint16_t getImageHeight(const unsigned char image[]);
+
+// Stable identifiers for the bitmap assets shipped with the firmware. The
+// display-list viewer uses these to look up its own copy of each asset.
+enum ImageId : uint32_t {
+	IMAGE_NONE       = 0,
+	IMAGE_CUTE_GHOST = 1,
+	IMAGE_DEADZONE   = 2,
+	IMAGE_AWAIT      = 3,
+	IMAGE_MOVEWAIT   = 4,
+	IMAGE_CROUCH     = 5,
+	IMAGE_LEDGE_L    = 6,
+	IMAGE_LEDGE_R    = 7,
+};
+
 void drawImage(unsigned char bitmap[],
                const unsigned char image[],
                const unsigned char index[],
                const uint16_t x,
-               const uint16_t y);
+               const uint16_t y,
+               const uint32_t imageId);
 
 void drawLine(unsigned char bitmap[],
               const uint16_t xStart,

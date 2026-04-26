@@ -9,9 +9,27 @@
 #include "storage/pages/metadata.h"
 #include "cvideo.h"
 #include "cvideo_variables.h"
+#include "displayList.h"
+#include "games/ping.h"
 #include "hardware/clocks.h"
 
+// Bitmap defined in cvideo.cpp; the menu draw functions render into it.
+// We can use it from core 1 in display-list-only mode (no composite video).
+extern unsigned char _bitmap[];
+
 volatile bool _videoOut = false;
+// Set by the 0xC0 (DisplayListRead) handler the first time it is invoked.
+// When true, core 1 runs the menu / display-list build loop so that
+// subsequent 0xC0 reads return real frame data over SI even when the user
+// is not in TRS video mode.
+volatile bool _videoOverSi = false;
+// Mirrors the role of _startSync from cvideo.cpp: a 60 Hz tick that paces
+// the menu / display-list logic so handleMenuButtons' lockout counters
+// (calibrated in 1/60 s units) behave the same as in TRS video mode.
+volatile bool _siSync = false;
+// Software version, captured at boot so the menu draw on core 1 has access
+// to it without us needing to plumb it through.
+int _videoVersion = 0;
 //Variables used by PhobVision to communicate with the event loop core
 volatile bool _sync = false;
 volatile uint8_t _pleaseCommit = 0;//255 = redraw please
@@ -703,7 +721,7 @@ void second_core() {
 		//pwm_set_gpio_level(_pinLED, 255*gpio_get_out_level(_pinSpare0));
 
 		//check if we should be reporting values yet
-		if((_hardware.B || _controls.autoInit || _videoOut) && !running){
+		if((_hardware.B || _controls.autoInit || _videoOut || _videoOverSi) && !running){
 			running=true;
 		}
 
@@ -759,6 +777,64 @@ void second_core() {
 
 		//read the controller's buttons
 		processButtons(_pinList, _btn, _hardware, _controls, _gains, _normGains, _currentCalStep, _currentRemapStep, _currentlyRaw, running, tempCalPointsX, tempCalPointsY, whichStick, notchStatus, notchAngles, measuredNotchAngles, _aStickParams, _cStickParams);
+
+		// Display-list-over-SI mode: when 0xC0 has been received but the user
+		// is not in TRS video mode (videoOut() is not running on the other
+		// core), drive the menu + record a display list here so subsequent
+		// 0xC0 reads have content to return.
+		if(_videoOverSi && !_videoOut) {
+			static unsigned int siMenuIndex = 0;
+			static int siItemIndex = 0;
+			static uint8_t siRedraw = 1;
+			static bool siChangeMade = false;
+
+			// Wait for the next 60 Hz SI tick — same role _startSync plays
+			// for TRS video. handleMenuButtons' lockout counters depend on
+			// being called at this cadence.
+			if(!_siSync) {
+				continue;
+			}
+			_siSync = false;
+
+			if(_pleaseCommit == 255) {
+				siRedraw = 1;
+				_pleaseCommit = 0;
+			}
+
+			if(_pleaseCommit == 100) {
+				if(runPing(_bitmap, _hardware, _raw, _controls)) {
+					_pleaseCommit = 99;
+				}
+			}
+
+			if(_pleaseCommit < 100) {
+				handleMenuButtons(_bitmap, siMenuIndex, siItemIndex, siRedraw, siChangeMade,
+				                  _currentCalStep, _currentRemapStep, _pleaseCommit,
+				                  _btn, _hardware, _controls, _dataCapture);
+
+				if(siRedraw == 2) {
+					displayListBeginFrame(VWIDTH, VHEIGHT, siRedraw);
+					siRedraw = 0;
+					drawMenuFast(_bitmap, siMenuIndex, siItemIndex, siChangeMade,
+					             _currentCalStep, _currentRemapStep,
+					             _btn, _hardware, _raw, _controls,
+					             _aStickParams, _cStickParams);
+					displayListEndFrame();
+					precomputeDisplayListChunks();
+				} else if(siRedraw == 1) {
+					displayListBeginFrame(VWIDTH, VHEIGHT, siRedraw);
+					siRedraw = 0;
+					memset(_bitmap, BLACK2, BUFFERLEN);
+					displayListRecordClear(BLACK2);
+					drawMenu(_bitmap, siMenuIndex, siItemIndex, siChangeMade,
+					         _currentCalStep, _currentRemapStep, _videoVersion,
+					         _btn, _raw, _controls, _aStickParams, _cStickParams,
+					         _dataCapture);
+					displayListEndFrame();
+					precomputeDisplayListChunks();
+				}
+			}
+		}
 
 	}
 }
@@ -877,17 +953,32 @@ int main() {
 
 	multicore_lockout_victim_init();
 
+	// 60 Hz tick to drive the SI display-list menu logic on core 1, mirroring
+	// the vsync cadence cvideo provides for TRS video mode. Started here so
+	// it runs in both modes; second_core only consumes it when in
+	// video-over-SI mode.
+	static repeating_timer_t _siSyncTimer;
+	add_repeating_timer_us(-16667, [](repeating_timer_t*) -> bool {
+		_siSync = true;
+		return true;
+	}, nullptr, &_siSyncTimer);
+
 	multicore_launch_core1(second_core);
 
 	//Run comms unless Z is held while plugging in
 	if(_hardware.Z) {
 #ifdef BUILD_DEV
-		const int version = -SW_VERSION;
+		_videoVersion = -SW_VERSION;
 #else //BUILD_DEV
-		const int version = SW_VERSION;
+		_videoVersion = SW_VERSION;
 #endif //BUILD_DEV
-		videoOut(_pinDac0, _btn, _hardware, _raw, _controls, _aStickParams, _cStickParams, _dataCapture, _sync, _pleaseCommit, _currentCalStep, _currentRemapStep, version);
+		videoOut(_pinDac0, _btn, _hardware, _raw, _controls, _aStickParams, _cStickParams, _dataCapture, _sync, _pleaseCommit, _currentCalStep, _currentRemapStep, _videoVersion);
 	} else {
+#ifdef BUILD_DEV
+		_videoVersion = -SW_VERSION;
+#else //BUILD_DEV
+		_videoVersion = SW_VERSION;
+#endif //BUILD_DEV
 		enterMode(_pinTX,
 				_pinRumble,
 				_pinBrake,

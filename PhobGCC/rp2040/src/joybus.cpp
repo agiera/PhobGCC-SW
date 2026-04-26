@@ -13,9 +13,10 @@
 #define ORG 127
 
 // --- Display-list transfer layout (0xC0 read command) ---
-// Each 80-byte transfer: [0]=numChunks, [1]=chunkIndex, [2..79]=78 bytes of DL data.
-#define DISPLAY_LIST_CHUNK_DATA_SIZE     78
-#define DISPLAY_LIST_CHUNK_TRANSFER_SIZE 80
+// Each 1024-byte transfer: [0]=numChunks, [1]=chunkIndex, [2..1023]=1022 bytes of DL data.
+// 1022-byte chunks let the input-viewer frame fit in a single SI transfer.
+#define DISPLAY_LIST_CHUNK_DATA_SIZE     510
+#define DISPLAY_LIST_CHUNK_TRANSFER_SIZE 512
 #define DISPLAY_LIST_MAX_BYTES           4096
 #define DISPLAY_LIST_MAX_CHUNKS ((DISPLAY_LIST_MAX_BYTES + DISPLAY_LIST_CHUNK_DATA_SIZE - 1) / DISPLAY_LIST_CHUNK_DATA_SIZE)
 
@@ -30,13 +31,28 @@ static uint32_t metadataAckPioResult[2];
 static int metadataAckPioResultLen;
 
 // Precomputed PIO responses for each display-list chunk.
-// Rebuilt on core 0 after each draw by precomputeDisplayListChunks();
-// read on either core by handleDisplayListRead().
-static uint32_t displayListPioChunks[DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE / 2 + 1];
-static int displayListPioChunkLens[DISPLAY_LIST_MAX_CHUNKS];
+// Double-buffered so core 1 can rebuild a frame's chunks without racing
+// against core 0 (the SI handler) reading them. Core 1 writes the inactive
+// buffer, then publishes by flipping `displayListActiveBuf` atomically.
+// `displayListNumChunks` is published last so readers always see a
+// consistent (numChunks, chunks[]) pair.
+//
+// Across multi-chunk frames the reader's jbPut can span more than one
+// 60 Hz draw, by which point the previously-active buffer has become the
+// next write target. To prevent that, the reader publishes which buffer
+// it is currently using in `displayListReaderBuf`; the writer stalls if
+// it would clobber that slot.
+static uint32_t displayListPioChunks[2][DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE / 2 + 1];
+static int displayListPioChunkLens[2][DISPLAY_LIST_MAX_CHUNKS];
+static volatile uint8_t displayListActiveBuf = 0;
+static volatile int8_t displayListReaderBuf = -1;  // -1 = idle
 static volatile uint8_t displayListNumChunks = 0;
 
 extern volatile bool _pleaseCommitMetadata;
+// When the host first issues a 0xC0 (DisplayListRead), promote the
+// controller into "video over SI" mode so core 1 starts building a real
+// display list. Defined in main.cpp.
+extern volatile bool _videoOverSi;
 
 /* PIOs are separate state machines for handling IOs with high timing precision. You load a program into them and they do their stuff on their own with deterministic timing,
    communicating with the main cores via FIFOs (and interrupts, if you want).
@@ -257,19 +273,31 @@ static void handleMetadataWrite(JoybusCtx* ctx) {
 }
 
 static void handleDisplayListRead(JoybusCtx* ctx) {
+    // Promote the controller into video-over-SI mode on the first 0xC0
+    // we see. Core 1 watches this flag and starts building display lists.
+    _videoOverSi = true;
     uint8_t chunkIndex = jbReadBlocking(ctx);
+    // Snapshot active buffer + chunk count together so a mid-read swap
+    // can't tear (numChunks/chunk slot from different generations).
+    uint8_t buf = displayListActiveBuf;
+    // Claim the buffer so the writer won't pick it as next write target.
+    // The writer checks `displayListReaderBuf` and stalls if we name the
+    // buffer it was about to clobber.
+    displayListReaderBuf = (int8_t)buf;
     uint8_t n = displayListNumChunks;
     if (n == 0) {
         // No display list built yet. Drop back to input to avoid leaving PIO
         // stuck in output mode with an empty FIFO.
         sleep_us(7);
         jbSwitchToIn(ctx);
+        displayListReaderBuf = -1;
         return;
     }
     if (chunkIndex >= n) chunkIndex = 0;
     sleep_us(7);
     jbSwitchToOut(ctx);
-    jbPut(ctx, displayListPioChunks[chunkIndex], displayListPioChunkLens[chunkIndex]);
+    jbPut(ctx, displayListPioChunks[buf][chunkIndex], displayListPioChunkLens[buf][chunkIndex]);
+    displayListReaderBuf = -1;
 }
 
 static void handleUnknown(JoybusCtx* ctx) {
@@ -327,8 +355,21 @@ void precomputeDisplayListChunks() {
     if (nChunks == 0) nChunks = 1;
     if (nChunks > DISPLAY_LIST_MAX_CHUNKS) nChunks = DISPLAY_LIST_MAX_CHUNKS;
 
+    // Write into the inactive buffer so core 0's in-flight reads from the
+    // active buffer aren't disturbed.
+    uint8_t writeBuf = displayListActiveBuf ^ 1;
+
+    // Across multi-chunk frames, a reader that started against the now-
+    // inactive buffer may still be in flight (its jbPut spans this 60 Hz
+    // tick).  Stall until that read completes so we don't tear its data.
+    while (displayListReaderBuf == (int8_t)writeBuf) {
+        tight_loop_contents();
+    }
+
     for (uint8_t c = 0; c < nChunks; c++) {
-        uint8_t buf[DISPLAY_LIST_CHUNK_TRANSFER_SIZE];
+        // Static so we don't blow core 1's 4 KB stack with a 512-byte
+        // local on top of a deep menu-draw call chain.
+        static uint8_t buf[DISPLAY_LIST_CHUNK_TRANSFER_SIZE];
         buf[0] = nChunks;
         buf[1] = c;
         uint16_t off = (uint16_t)c * DISPLAY_LIST_CHUNK_DATA_SIZE;
@@ -341,10 +382,14 @@ void precomputeDisplayListChunks() {
             memset(&buf[2 + copy], 0, DISPLAY_LIST_CHUNK_DATA_SIZE - copy);
         }
         convertToPio(buf, DISPLAY_LIST_CHUNK_TRANSFER_SIZE,
-                     displayListPioChunks[c], displayListPioChunkLens[c]);
+                     displayListPioChunks[writeBuf][c], displayListPioChunkLens[writeBuf][c]);
     }
 
-    // Publish the new chunk count last so readers never see a mismatch.
+    // Publish the new buffer first, then the chunk count.  A concurrent
+    // reader sees either (oldBuf, oldN) or (newBuf, newN); never a torn
+    // pair.  The chunkIndex clamp in handleDisplayListRead handles the
+    // (newBuf, oldN) transient when newN < oldN.
+    displayListActiveBuf = writeBuf;
     displayListNumChunks = nChunks;
 }
 
