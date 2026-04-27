@@ -78,6 +78,22 @@ void second_core() {
 
 
 	while(true) { //main event loop
+		// Lazily start the 60 Hz SI tick the first time a host requests
+		// video-over-SI (0xC0).  Until then this core runs identically to
+		// pre-video-over-SI firmware: no extra alarm IRQs, no extra work.
+		// Critically, this means a Wii (which never issues 0xC0) sees no
+		// behavioral change vs. the previous release, so joybus timing on
+		// core 0 is undisturbed.  Registering on core 1 also keeps the
+		// alarm IRQ off core 0 once it does fire.
+		static bool _siSyncTimerStarted = false;
+		static repeating_timer_t _siSyncTimer;
+		if(_videoOverSi && !_siSyncTimerStarted) {
+			add_repeating_timer_us(-16667, [](repeating_timer_t*) -> bool {
+				_siSync = true;
+				return true;
+			}, nullptr, &_siSyncTimer);
+			_siSyncTimerStarted = true;
+		}
 		//Set up persistent storage for calibration
 		static float tempCalPointsX[_noOfCalibrationPoints];
 		static float tempCalPointsY[_noOfCalibrationPoints];
@@ -952,16 +968,6 @@ int main() {
 	}
 
 	multicore_lockout_victim_init();
-
-	// 60 Hz tick to drive the SI display-list menu logic on core 1, mirroring
-	// the vsync cadence cvideo provides for TRS video mode. Started here so
-	// it runs in both modes; second_core only consumes it when in
-	// video-over-SI mode.
-	static repeating_timer_t _siSyncTimer;
-	add_repeating_timer_us(-16667, [](repeating_timer_t*) -> bool {
-		_siSync = true;
-		return true;
-	}, nullptr, &_siSyncTimer);
 
 	multicore_launch_core1(second_core);
 
