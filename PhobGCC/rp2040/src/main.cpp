@@ -39,8 +39,20 @@ int _currentRemapStep = -1;//-1 means not remapping
 bool _currentlyRaw = false;
 DataCapture _dataCapture;
 
-//This gets called by the comms library
-GCReport __no_inline_not_in_flash_func(buttonsToGCReport)() {
+// DIAGNOSTIC: shift .bss layout to test whether the directional bug is
+// caused by aliasing/positioning of post-displayListPioChunks symbols.
+// Set _LAYOUT_PAD_BYTES to 0, 8192, 16384 in successive builds and observe.
+#ifndef LAYOUT_PAD_BYTES
+#define LAYOUT_PAD_BYTES 16384
+#endif
+__attribute__((used)) static volatile uint8_t _layoutPad[LAYOUT_PAD_BYTES];
+
+//This gets called by the comms library on the joybus poll hot path.
+//Pinned in scratch X (isolated 4 KB AHB slave) alongside enterMode/
+//convertToPio/convertGCReport so the entire core 0 poll-response path
+//runs from a RAM bank that no other master (core 1, DMA, XIP cache)
+//can stall.
+GCReport __scratch_x("joybus") buttonsToGCReport() {
 	GCReport report = {{
 		.a       = _btn.A,
 		.b       = _btn.B,
@@ -731,7 +743,7 @@ void second_core() {
 		//gpio_put(_pinSpare0, !gpio_get_out_level(_pinSpare0));
 		//pwm_set_gpio_level(_pinLED, 255*gpio_get_out_level(_pinSpare0));
 
-		static bool running = false;
+		static bool running = true;
 
 		//gpio_put(_pinSpare0, !gpio_get_out_level(_pinSpare0));
 		//pwm_set_gpio_level(_pinLED, 255*gpio_get_out_level(_pinSpare0));
@@ -969,7 +981,13 @@ int main() {
 
 	multicore_lockout_victim_init();
 
-	multicore_launch_core1(second_core);
+	// Move core 1's stack out of scratch X (SRAM4) into striped SRAM0-3.
+	// Core 0's joybus poll path is pinned in scratch X; if core 1's stack
+	// also lived there, every core 1 push/pop would contend with core 0's
+	// instruction fetches on the same AHB slave. Default SDK stack size
+	// is 2 KB.
+	static uint32_t core1_stack[512] __attribute__((aligned(8)));
+	multicore_launch_core1_with_stack(second_core, core1_stack, sizeof(core1_stack));
 
 	//Run comms unless Z is held while plugging in
 	if(_hardware.Z) {
