@@ -4,6 +4,7 @@
 #include "hardware/pwm.h"
 
 #include "hardware/pio.h"
+#include "hardware/timer.h"
 #include "joybus.pio.h"
 #include "storage/pages/metadata.h"
 #include "displayList.h"
@@ -184,15 +185,32 @@ static inline uint8_t jbReadBlocking(JoybusCtx* ctx) {
     return (uint8_t)pio_sm_get_blocking(ctx->pio, ctx->sm);
 }
 
+// Tight microsecond busy-wait. Used on the joybus poll hot path instead
+// of sleep_us(), which lives in flash; an XIP cache miss while core 1 is
+// also fetching from flash can blow the SI response deadline.
+static inline void jbDelayUs(uint32_t us) {
+    uint32_t start = time_us_32();
+    while ((time_us_32() - start) < us) {
+        tight_loop_contents();
+    }
+}
+
+// Switch the PIO state machine between input and output mode.  We avoid
+// pio_sm_init() here because it lives in flash; instead we stop the SM,
+// reset its shift state, jump it to the desired entry point, and restart
+// it.  All three SDK calls below are header-inlines that compile to a
+// handful of MMIO writes, so the hot path stays out of flash.
 static inline void jbSwitchToOut(JoybusCtx* ctx) {
     pio_sm_set_enabled(ctx->pio, ctx->sm, false);
-    pio_sm_init(ctx->pio, ctx->sm, ctx->offset + joybus_offset_outmode, &ctx->config);
+    pio_sm_restart(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + joybus_offset_outmode));
     pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 }
 
 static inline void jbSwitchToIn(JoybusCtx* ctx) {
     pio_sm_set_enabled(ctx->pio, ctx->sm, false);
-    pio_sm_init(ctx->pio, ctx->sm, ctx->offset + joybus_offset_inmode, &ctx->config);
+    pio_sm_restart(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + joybus_offset_inmode));
     pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 }
 
@@ -204,16 +222,16 @@ static inline void jbPut(JoybusCtx* ctx, const uint32_t* words, int len) {
 
 // --- Handlers ---------------------------------------------------------------
 
-static void handleProbe(JoybusCtx* ctx) {
+static void __time_critical_func(handleProbe)(JoybusCtx* ctx) {
     uint8_t resp[3] = { 0x09, 0x00, 0x03 };
     uint32_t w[2]; int wl;
     convertToPio(resp, 3, w, wl);
-    sleep_us(6); // wait out trailing stop bit before driving the line
+    jbDelayUs(6); // wait out trailing stop bit before driving the line
     jbSwitchToOut(ctx);
     jbPut(ctx, w, wl);
 }
 
-static void handleOrigin(JoybusCtx* ctx) {
+static void __time_critical_func(handleOrigin)(JoybusCtx* ctx) {
     uint8_t resp[10] = { 0x00, 0x80, ORG, ORG, ORG, ORG, 0, 0, 0, 0 };
     uint32_t w[6]; int wl;
     convertToPio(resp, 10, w, wl);
@@ -225,7 +243,7 @@ static void handleOrigin(JoybusCtx* ctx) {
 // Poll: reads mode byte, builds report via callback, reads rumble byte,
 // sends the 8-byte controller state. Returns the rumble byte so the caller
 // can drive rumble hardware if it has any.
-static uint8_t handlePoll(JoybusCtx* ctx, std::function<GCReport()>& func) {
+static uint8_t __time_critical_func(handlePoll)(JoybusCtx* ctx, std::function<GCReport()>& func) {
     GCReport gcReport = func();
     GCReport dest;
 
@@ -237,21 +255,21 @@ static uint8_t handlePoll(JoybusCtx* ctx, std::function<GCReport()>& func) {
 
     uint8_t rumbleByte = jbReadBlocking(ctx);
 
-    sleep_us(7); // don't overwrite the stop bit of the poll command
+    jbDelayUs(7); // don't overwrite the stop bit of the poll command
     jbSwitchToOut(ctx);
     jbPut(ctx, w, wl);
     return rumbleByte;
 }
 
-static void handleMetadataRead(JoybusCtx* ctx) {
+static void __time_critical_func(handleMetadataRead)(JoybusCtx* ctx) {
     uint8_t chunkIndex = jbReadBlocking(ctx);
     if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
-    sleep_us(7);
+    jbDelayUs(7);
     jbSwitchToOut(ctx);
     jbPut(ctx, metadataPioChunks[chunkIndex], metadataPioChunkLens[chunkIndex]);
 }
 
-static void handleMetadataWrite(JoybusCtx* ctx) {
+static void __time_critical_func(handleMetadataWrite)(JoybusCtx* ctx) {
     uint8_t chunkIndex = jbReadBlocking(ctx);
     uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
     for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
@@ -267,12 +285,12 @@ static void handleMetadataWrite(JoybusCtx* ctx) {
         setControllerMetadata(controllerMetadata, metadataNumChunks);
         _pleaseCommitMetadata = true;
     }
-    sleep_us(7);
+    jbDelayUs(7);
     jbSwitchToOut(ctx);
     jbPut(ctx, metadataAckPioResult, metadataAckPioResultLen);
 }
 
-static void handleDisplayListRead(JoybusCtx* ctx) {
+static void __time_critical_func(handleDisplayListRead)(JoybusCtx* ctx) {
     // Promote the controller into video-over-SI mode on the first 0xC0
     // we see. Core 1 watches this flag and starts building display lists.
     _videoOverSi = true;
@@ -288,13 +306,13 @@ static void handleDisplayListRead(JoybusCtx* ctx) {
     if (n == 0) {
         // No display list built yet. Drop back to input to avoid leaving PIO
         // stuck in output mode with an empty FIFO.
-        sleep_us(7);
+        jbDelayUs(7);
         jbSwitchToIn(ctx);
         displayListReaderBuf = -1;
         return;
     }
     if (chunkIndex >= n) chunkIndex = 0;
-    sleep_us(7);
+    jbDelayUs(7);
     jbSwitchToOut(ctx);
     jbPut(ctx, displayListPioChunks[buf][chunkIndex], displayListPioChunkLens[buf][chunkIndex]);
     displayListReaderBuf = -1;
@@ -309,7 +327,7 @@ static void handleUnknown(JoybusCtx* ctx) {
 }
 
 // Dispatch a fully-received command byte. Optional rumble pins (<0 to skip).
-static void dispatchCommand(JoybusCtx* ctx,
+static void __time_critical_func(dispatchCommand)(JoybusCtx* ctx,
                             uint8_t cmd,
                             std::function<GCReport()>& func,
                             int rumblePin,
