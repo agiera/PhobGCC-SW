@@ -44,10 +44,6 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_LIST_DIR}/generated/cvideo.pio.h
 target_compile_definitions(phobgcc_rp2040
 	PRIVATE
 	PICO_XOSC_STARTUP_DELAY_MULTIPLIER=64
-	# We provide our own core1 stack in striped SRAM via
-	# multicore_launch_core1_with_stack(); free up scratch X (SRAM4)
-	# for the joybus poll path by zeroing the SDK's default reservation.
-	PICO_CORE1_STACK_SIZE=0
 	#PICO_DEFAULT_BOOT_STAGE2=boot2_generic_03h
 	#PICO_FLASH_SPI_CLKDIV=8
 	)
