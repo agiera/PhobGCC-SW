@@ -1,31 +1,78 @@
 ; THIS PIO PROGRAM EXPECTS THE SYSTEM CLOCK TO BE 125MHz
 
+; Joybus PIO timing is calibrated around a target PIO clock (see joybus.cpp).
+; Keep this program's cycle counts and the C-side target PIO clock together.
+;
+; Joybus bit on the wire: ~5 us total. Start: line low for 1us. Data: high
+; or low for ~3us based on bit value. End: high for ~1us. A "stop bit" is a
+; half-width (~2us) low pulse with no data middle, then idle high.
+;
+; Receive: every ~5us bit, sample at the data window mid-point.
+; Send: emit 1us low + 3us data level + 1us high per bit. The 9th bit per
+; word is a marker: 1 means "this word's first 8 bits were data, terminate
+; with a stop bit"; 0 means "no more bits, return to receive mode".
+
 ; Input is a succession of optional bools: (value/do we output something)
 ; This makes so we can output an arbitrary number of bits without worrying about sizes
 ; Useful since the end bit makes it so the output size is always = 1 [8]
 ; Clock is / 5 i.e 25MHz
 ;  This will crash if fed an output of len == -1 [Z/8Z]
 .program joybus ;
-PUBLIC inmode: ; Code must force a jump here once it's done using the out mode
-    set pindirs, 0 ;
+
+; =====================
+; Calibration constants
+; =====================
+; All values are "extra" delay cycles for PIO instructions using [N].
+; At 25MHz PIO clock, 1 cycle = 40ns.
+.define public JB_RX_WAIT_A      31   ; receive sample pre-delay part A
+.define public JB_RX_WAIT_B      29   ; receive sample pre-delay part B
+.define public JB_TURN_A         24   ; reply turnaround delay part A
+.define public JB_TURN_B         24   ; reply turnaround delay part B
+.define public JB_TX_LOW         24   ; ~1us low pulse
+.define public JB_TX_DATA_A      24   ; ~1us data hold part A
+.define public JB_TX_DATA_B      24   ; ~1us data hold part B
+.define public JB_TX_HIGH        19   ; ~0.8us high return
+
+PUBLIC inmode: ; Compatibility entry; C may force a jump here to reset state
+    mov isr, null ;          ; clear any partial-byte residue
+    set pindirs, 0 ;         ; line is input (open-collector via pullup)
 inagain: ;
-    wait 0 pin 0 [31] ; After the instruction complete we wait 61 cycles and read on the 62th
-    nop [31] ;
-    in pins, 1 ;
-    wait 1 pin 0 ;
-    jmp inagain ; 
-;
-PUBLIC outmode: ; External code must force a jump here in reaction to the RX FIFO contents
+    mov x, status ;          ; X = ~0 if TX FIFO < 1 (empty), 0 if has data
+    jmp !x prep_reply ;      ; TX has data => stop reading, go reply
+    jmp pin inagain ;        ; pin high (idle) => keep polling
+    ; pin low: a bit is starting
+    nop [JB_RX_WAIT_A] ;     ; wait into the data window
+    nop [JB_RX_WAIT_B] ;     ; note that the `mov` and `jmp` instructions
+                             ; that check for TX end add ~2 cycles compared
+                             ; to just reading
+    in pins, 1 ;             ; sample mid-bit; autopush at 8-bit threshold
+    wait 1 pin 0 ;           ; wait line back to high before next bit
+    jmp inagain ;
+
+prep_reply: ;
+    ; C just pushed at least one word. Absorb the residue of the host's
+    ; stop bit (~2us) before driving the line, then fall into outmode.
+    mov isr, null ;          ; discard partial-byte ISR contents
+    nop [JB_TURN_A] ;        ; turnaround delay part A
+    nop [JB_TURN_B] ;        ; turnaround delay part B
+    set pindirs, 1 ;         ; flip to output
+    set pins, 1 ;            ; idle high before first low pulse
+
+PUBLIC outmode: ; Compatibility entry; C may force a jump here to send
     set pins, 1 ;
     set pindirs, 1 ;
 outagain: ;
-    pull ifempty block ; On pull 1 et ensuite on l'utilise pour X ET Y ?
-    out X, 1 ; X = what should we output
-    out Y, 1 ; Y = should we output something
-    jmp !Y inmode ; if Y 0, empty the queue
-    set pins, 0 [ 24 ] ;
-    mov pins, X [ 24 ] ;
-    mov pins, X [ 24 ] ;
-    set pins, 1 [ 19 ] ;
+    pull ifempty block ;     ; fetch next response word from TX FIFO
+    out X, 1 ;               ; X = bit to output
+    out Y, 1 ;               ; Y = "is there a bit?" (0 = end of response)
+    jmp !Y end_reply ;       ; Y == 0: response complete, return to receive
+    set pins, 0 [JB_TX_LOW] ;    ; low (start)
+    mov pins, X [JB_TX_DATA_A] ; ; data hold A
+    mov pins, X [JB_TX_DATA_B] ; ; data hold B
+    set pins, 1 [JB_TX_HIGH] ;   ; high (return to idle)
     jmp outagain ;
+
+end_reply: ;
+    set pindirs, 0 ;         ; release the line
+    jmp inmode ;             ; PIO-side auto-transition back to receive
 ;

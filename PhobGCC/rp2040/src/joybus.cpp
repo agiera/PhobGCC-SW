@@ -117,10 +117,18 @@ void __time_critical_func(enterMode)(const int dataPin,
     sm_config_set_clkdiv(&config, 5);
     sm_config_set_out_shift(&config, true, false, 32);
     sm_config_set_in_shift(&config, false, true, 8);
-    
+    // PIO `mov x, status` returns 0xFFFFFFFF when TX FIFO has fewer than 1
+    // entries (i.e. is empty), 0 otherwise. The receive loop polls this so
+    // it knows when C has pushed a response and it should switch to send.
+    sm_config_set_mov_status(&config, STATUS_TX_LESSTHAN, 1);
+    // PIO `jmp pin` reads the data line so the receive loop can poll for
+    // the next bit's falling edge in software (instead of `wait 0 pin 0`,
+    // which would block indefinitely and prevent the TX FIFO check).
+    sm_config_set_jmp_pin(&config, dataPin);
+
     pio_sm_init(pio, 0, offset, &config);
     pio_sm_set_enabled(pio, 0, true);
-    
+
     while (true) {
 		uint8_t joybusByte = pio_sm_get_blocking(pio, 0);
 
@@ -129,12 +137,7 @@ void __time_critical_func(enterMode)(const int dataPin,
             uint32_t result[2];
             int resultLen;
             convertToPio(probeResponse, 3, result, resultLen);
-            sleep_us(6); // 3.75us into the bit before end bit => 6.25 to wait if the end-bit is 5us long
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
+            // PIO auto-transitions to send when it sees TX FIFO has data.
             for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
         }
         else if (joybusByte == 0x41) { // Origin (NOT 0x81)
@@ -144,12 +147,6 @@ void __time_critical_func(enterMode)(const int dataPin,
             uint32_t result[6];
             int resultLen;
             convertToPio(originResponse, 10, result, resultLen);
-            // Here we don't wait because convertToPio takes time
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
             for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
         }
         else if (joybusByte == 0x40) { // Could check values past the first byte for reliability
@@ -171,13 +168,8 @@ void __time_critical_func(enterMode)(const int dataPin,
 			//get the third byte; we do this interleaved with work that must be done
             joybusByte = pio_sm_get_blocking(pio, 0);
 
-			//sleep_us(4);//add delay so we don't overwrite the stop bit
-			sleep_us(7);//add delay so we don't overwrite the stop bit
-
-            pio_sm_set_enabled(pio, 0, false);
-            pio_sm_init(pio, 0, offset+joybus_offset_outmode, &config);
-            pio_sm_set_enabled(pio, 0, true);
-
+            // PIO absorbs the trailing stop-bit residue (~2us) in cycles
+            // before driving the line, so no C-side sleep is required.
             for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
 
 			//Rumble
@@ -196,7 +188,9 @@ void __time_critical_func(enterMode)(const int dataPin,
             pio_sm_set_enabled(pio, 0, false);
             sleep_us(400);
             //If an unmatched communication happens, we wait for 400us for it to finish for sure before starting to listen again
-            pio_sm_init(pio, 0, offset+joybus_offset_inmode, &config);
+            pio_sm_clear_fifos(pio, 0);
+            pio_sm_restart(pio, 0);
+            pio_sm_exec(pio, 0, pio_encode_jmp(offset + joybus_offset_inmode));
             pio_sm_set_enabled(pio, 0, true);
         }
     }
