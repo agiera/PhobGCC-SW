@@ -4,6 +4,7 @@
 #include "hardware/pwm.h"
 
 #include "hardware/pio.h"
+#include "hardware/clocks.h"
 #include "joybus.pio.h"
 #include <string.h>
 #include <math.h>
@@ -114,7 +115,12 @@ void __time_critical_func(enterMode)(const int dataPin,
     sm_config_set_in_pins(&config, dataPin);
     sm_config_set_out_pins(&config, dataPin, 1);
     sm_config_set_set_pins(&config, dataPin, 1);
-    sm_config_set_clkdiv(&config, 5);
+    // The PIO program is calibrated for a 25 MHz PIO clock. Derive the
+    // divider from the current system clock so timing is correct whether
+    // sys_clk is 125 MHz (clkdiv 5) or 250 MHz (clkdiv 10).
+    const float pioTargetHz = 25000000.0f;
+    float clkdiv = (float)clock_get_hz(clk_sys) / pioTargetHz;
+    sm_config_set_clkdiv(&config, clkdiv);
     sm_config_set_out_shift(&config, true, false, 32);
     sm_config_set_in_shift(&config, false, true, 8);
     // PIO `mov x, status` returns 0xFFFFFFFF when TX FIFO has fewer than 1
@@ -127,6 +133,20 @@ void __time_critical_func(enterMode)(const int dataPin,
     sm_config_set_jmp_pin(&config, dataPin);
 
     pio_sm_init(pio, 0, offset, &config);
+    // Start at `inmode_clean` (skips the residue-flush `push noblock` that
+    // `inmode` does). At cold start the ISR is empty, so pushing it would
+    // emit a phantom 0x00 into the RX FIFO that C reads as a fake probe,
+    // desyncing the command stream until the host's retry logic happens
+    // to realign.
+    pio_sm_exec(pio, 0, pio_encode_jmp(offset + joybus_offset_inmode_clean));
+    // Drain anything the host has been blasting onto the bus while we
+    // were booting (probes/origins/polls all queue up in the RX FIFO the
+    // instant we enable the SM). Without this, the loop's first reads
+    // pull stale bytes and the residue-discard accounting goes off by
+    // one for several cycles -- on the first poll the byte read as
+    // "rumble" is actually a misaligned earlier byte, which on the Wii
+    // happens to have LSB=1 and causes a spurious rumble at plug-in.
+    pio_sm_clear_fifos(pio, 0);
     pio_sm_set_enabled(pio, 0, true);
 
     while (true) {
@@ -139,20 +159,20 @@ void __time_critical_func(enterMode)(const int dataPin,
             convertToPio(probeResponse, 3, result, resultLen);
             // PIO auto-transitions to send when it sees TX FIFO has data.
             for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
+            // Discard the 1-bit stop-residue word that PIO pushes when it
+            // re-enters `inmode` after end_reply. Blocks until PIO is done
+            // transmitting and has executed `push noblock`.
+            (void)pio_sm_get_blocking(pio, 0);
         }
         else if (joybusByte == 0x41) { // Origin (NOT 0x81)
-            gpio_put(25, 1);
             uint8_t originResponse[10] = { 0x00, 0x80, ORG, ORG, ORG, ORG, 0, 0, 0, 0 };
-            // TODO The origin response sends centered values in this code excerpt. Consider whether that makes sense for your project (digital controllers -> yes)
             uint32_t result[6];
             int resultLen;
             convertToPio(originResponse, 10, result, resultLen);
             for (int i = 0; i<resultLen; i++) pio_sm_put_blocking(pio, 0, result[i]);
+            (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
         }
-        else if (joybusByte == 0x40) { // Could check values past the first byte for reliability
-            //The call to the state building function happens here, because on digital controllers, it's near instant, so it can be done between the poll and the response
-            // It must be very fast (few us max) to be done between poll and response and still be compatible with adapters
-            // Consider whether that makes sense for your project. If your state building is long, use a different control flow i.e precompute somehow and have func read it
+        else if (joybusByte == 0x40) { // Poll
             GCReport gcReport = func();
             GCReport dest_report;
 
@@ -183,6 +203,7 @@ void __time_critical_func(enterMode)(const int dataPin,
                 pwm_set_gpio_level(brakePin, rumbleBrake ? 255 : 0);
             }
 
+            (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
         }
         else {
             pio_sm_set_enabled(pio, 0, false);
@@ -190,7 +211,10 @@ void __time_critical_func(enterMode)(const int dataPin,
             //If an unmatched communication happens, we wait for 400us for it to finish for sure before starting to listen again
             pio_sm_clear_fifos(pio, 0);
             pio_sm_restart(pio, 0);
-            pio_sm_exec(pio, 0, pio_encode_jmp(offset + joybus_offset_inmode));
+            // pio_sm_restart clears ISR + shift counter, so enter via
+            // `inmode_clean` to avoid the residue push that would emit a
+            // phantom 0x00 into the freshly-cleared RX FIFO.
+            pio_sm_exec(pio, 0, pio_encode_jmp(offset + joybus_offset_inmode_clean));
             pio_sm_set_enabled(pio, 0, true);
         }
     }

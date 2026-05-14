@@ -24,55 +24,126 @@
 ; =====================
 ; All values are "extra" delay cycles for PIO instructions using [N].
 ; At 25MHz PIO clock, 1 cycle = 40ns.
+;
+; Stop-bit detection timing (JB_IDLE_COUNT):
+;   After sampling a bit and waiting for line-high, we count cycles watching
+;   for the next falling edge. If it arrives, it is a data bit; restart.
+;   If it does not arrive before the counter expires, it is the trailing stop
+;   bit / idle gap; proceed to reply.
+;
+;   Timing at loop start (each `jmp pin` checks at the iteration start):
+;     "0" bit trailing high : ~25 cycles remaining before next fall
+;     "1" bit trailing high : ~75 cycles remaining before next fall
+;     Stop / idle           : no fall (infinite)
+;   The loop body uses `jmp pin [1]` + `jmp x--` = 3 cycles/iteration.
+;   JB_IDLE_COUNT = 27 → 1 (set x) + 28×3 = 85 cycles = 3.40µs timeout.
+;   Last check happens at cycle 82 (1 + 3*27).
+;   "1" bit trailing fall arrives at cycle ~75; margin = 7 cycles (280ns).
+;   MUST keep last-check cycle > 75 + jitter; firing early causes false
+;   reply triggers mid-command.
+;
+; Turnaround delay (JB_TURN_A/B):
+;   Fixed extra delay inserted after stop detection before driving the line.
+;   Total turnaround from stop-trailing-high begin to first reply low edge:
+;     85 (set x + idle_check) + (JB_TURN_A+1) + (JB_TURN_B+1) + 9 fixed
+;     = 96 cycles = 3.84µs at JB_TURN_A=JB_TURN_B=0.
+;   Increase these to slow down the reply; real GCCs respond in ~2-4µs.
 .define public JB_RX_WAIT_A      31   ; receive sample pre-delay part A
 .define public JB_RX_WAIT_B      29   ; receive sample pre-delay part B
-.define public JB_TURN_A         24   ; reply turnaround delay part A
-.define public JB_TURN_B         24   ; reply turnaround delay part B
+.define public JB_IDLE_COUNT     27   ; stop-bit high-idle loop count
+.define public JB_TURN_A         31   ; reply turnaround extra delay part A
+.define public JB_TURN_B         31   ; reply turnaround extra delay part B
 .define public JB_TX_LOW         24   ; ~1us low pulse
 .define public JB_TX_DATA_A      24   ; ~1us data hold part A
 .define public JB_TX_DATA_B      24   ; ~1us data hold part B
 .define public JB_TX_HIGH        19   ; ~0.8us high return
 
-PUBLIC inmode: ; Compatibility entry; C may force a jump here to reset state
-    mov isr, null ;          ; clear any partial-byte residue
-    set pindirs, 0 ;         ; line is input (open-collector via pullup)
+PUBLIC inmode: ;                ; entry from end_reply: flush stop-bit residue
+    push noblock ;              ; flush ISR contents AND reset shift counter.
+                                ; After a complete command, ISR holds the
+                                ; trailing stop bit (1-bit residue, counter=1).
+                                ; `mov isr, null` clears the value but NOT
+                                ; the shift counter (RP2040 §3.5.4), so it
+                                ; would mis-align the next byte. `push` is
+                                ; the only way to reset the counter. The
+                                ; pushed word is residue; C discards it
+                                ; after each reply.
+                                ; DO NOT enter here at startup / after
+                                ; pio_sm_restart -- ISR is already empty
+                                ; (counter=0) and the push would emit a
+                                ; phantom 0x00 that C reads as a probe.
+                                ; Use `inmode_clean` for those entries.
+PUBLIC inmode_clean: ;          ; cold-start / post-restart entry
+    set pindirs, 0 ;            ; line is input (open-collector via pullup)
 inagain: ;
-    mov x, status ;          ; X = ~0 if TX FIFO < 1 (empty), 0 if has data
-    jmp !x prep_reply ;      ; TX has data => stop reading, go reply
-    jmp pin inagain ;        ; pin high (idle) => keep polling
-    ; pin low: a bit is starting
-    nop [JB_RX_WAIT_A] ;     ; wait into the data window
-    nop [JB_RX_WAIT_B] ;     ; note that the `mov` and `jmp` instructions
-                             ; that check for TX end add ~2 cycles compared
-                             ; to just reading
-    in pins, 1 ;             ; sample mid-bit; autopush at 8-bit threshold
-    wait 1 pin 0 ;           ; wait line back to high before next bit
-    jmp inagain ;
-
-prep_reply: ;
-    ; C just pushed at least one word. Absorb the residue of the host's
-    ; stop bit (~2us) before driving the line, then fall into outmode.
-    mov isr, null ;          ; discard partial-byte ISR contents
-    nop [JB_TURN_A] ;        ; turnaround delay part A
-    nop [JB_TURN_B] ;        ; turnaround delay part B
-    set pindirs, 1 ;         ; flip to output
-    set pins, 1 ;            ; idle high before first low pulse
-
-PUBLIC outmode: ; Compatibility entry; C may force a jump here to send
-    set pins, 1 ;
-    set pindirs, 1 ;
+    jmp pin inagain ;           ; pin high (idle) => keep polling for fall
+    ; pin low: a data bit is starting
+    nop [JB_RX_WAIT_A] ;       ; wait into the data window
+    nop [JB_RX_WAIT_B] ;
+    in pins, 1 ;                ; sample mid-bit; autopush at 8-bit threshold
+    wait 1 pin 0 ;              ; wait for line to return high
+    ; --- Stop-bit detection ---
+    ; A stop bit is just "line goes low" -- indistinguishable from the next
+    ; data bit's start at the falling edge alone. We distinguish them by
+    ; *timing out* the wait for the next falling edge:
+    ;   "0" data bit  -> next fall arrives ~1 us after this bit's high edge
+    ;   "1" data bit  -> next fall arrives ~3 us after this bit's high edge
+    ;   end of cmd    -> stop bit pulse, then idle high forever (no fall)
+    ; JB_IDLE_COUNT is sized so the timeout (~3.3 us) reliably catches the
+    ; "1" data bit's next fall while still firing within a few us of the
+    ; stop bit's trailing high.
+    ;
+    ; The stop bit's falling edge IS still seen by this loop -- it looks
+    ; like another data bit. So the stop bit gets sampled as a phantom
+    ; 1-bit (because the 2 us low pulse ends before our 2.5 us sample
+    ; window), leaving ISR with a 1-bit residue. `inmode`'s `push noblock`
+    ; flushes that residue; C-side discards it after each reply.
+    set x, JB_IDLE_COUNT ;      ; arm timeout
+idle_loop: ;
+    jmp pin idle_continue [1] ; ; line still high -> 3 cyc per iter
+    jmp inagain ;               ; line went low -> sample next bit (data or stop)
+idle_continue: ;
+    jmp x-- idle_loop ;         ; decrement; falls through on timeout
+    ; --- Timeout: command complete, line is idle high ---
+tx_wait: ;
+    jmp pin maybe_send ;        ; still high -> check TX FIFO
+    jmp inagain ;               ; line went low -> host started another command
+maybe_send: ;
+    mov x, status ;             ; 0 if TX FIFO has data; ~0 if empty
+    jmp !x do_send ;            ; TX non-empty: drive line and send
+    jmp tx_wait ;               ; TX empty: keep waiting
+do_send: ;
+    nop [JB_TURN_A] ;           ; turnaround part A (extra cycles)
+    nop [JB_TURN_B] ;           ; turnaround part B (extra cycles)
+    ; CRITICAL ordering: stage `pins=1` BEFORE flipping pindirs to output,
+    ; otherwise the pin is driven to the previously-staged value (0 after
+    ; init) for one cycle, producing a 40ns LOW glitch the host may read
+    ; as a malformed start-of-reply.
+    set pins, 1 ;               ; stage idle-high before driving
+    set pindirs, 1 ;            ; flip to output (now driving high)
+PUBLIC outmode: ;               ; C may jmp here to send (pins must be set up)
 outagain: ;
-    pull ifempty block ;     ; fetch next response word from TX FIFO
-    out X, 1 ;               ; X = bit to output
-    out Y, 1 ;               ; Y = "is there a bit?" (0 = end of response)
-    jmp !Y end_reply ;       ; Y == 0: response complete, return to receive
-    set pins, 0 [JB_TX_LOW] ;    ; low (start)
-    mov pins, X [JB_TX_DATA_A] ; ; data hold A
-    mov pins, X [JB_TX_DATA_B] ; ; data hold B
-    set pins, 1 [JB_TX_HIGH] ;   ; high (return to idle)
+    pull ifempty block ;        ; fetch next response word from TX FIFO
+    out X, 1 ;                  ; X = bit to output
+    out Y, 1 ;                  ; Y = "is there a bit?" (0 = end of response)
+    jmp !Y end_reply ;          ; Y == 0: response complete, return to receive
+    set pins, 0 [JB_TX_LOW] ;  ; low (start pulse)
+    mov pins, X [JB_TX_DATA_A] ; data hold A
+    mov pins, X [JB_TX_DATA_B] ; data hold B
+    set pins, 1 [JB_TX_HIGH] ; ; high (return to idle)
     jmp outagain ;
-
 end_reply: ;
-    set pindirs, 0 ;         ; release the line
-    jmp inmode ;             ; PIO-side auto-transition back to receive
+    set pindirs, 0 ;            ; release the line (input / open-collector)
+    ; Drain any leftover OSR bits before returning to receive. A reply ends
+    ; on the first Y=0 it finds, which usually leaves the OSR mid-word
+    ; (e.g. 12 leftover bits for a 3-byte probe reply, 28 for a 10-byte
+    ; origin reply). Without this drain, the NEXT reply's `pull ifempty`
+    ; sees OSR not-empty and consumes the leftover zeros instead of fresh
+    ; FIFO data -> immediate end_reply with no transmission, then the
+    ; freshly-pushed words sit unread in TX FIFO. `out null, 32` saturates
+    ; the shift counter so the next `pull ifempty` will pull cleanly.
+    out null, 32 ;
+    ; implicit wrap: PC falls through to the program's first instruction
+    ; (inmode's `push noblock`). Saves an explicit `jmp inmode` slot --
+    ; we need every instruction we can get (32-slot PIO program memory).
 ;
