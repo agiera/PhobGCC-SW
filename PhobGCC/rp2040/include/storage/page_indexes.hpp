@@ -6,7 +6,8 @@
 
 enum class PageIndexes : int {
     MASTER = 0,
-    STORAGE = 1
+    STORAGE = 1,
+    METADATA = 2
 };
 
 #endif

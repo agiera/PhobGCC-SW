@@ -6,10 +6,23 @@
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 #include "joybus.pio.h"
+#include "storage/pages/metadata.h"
 #include <string.h>
 #include <math.h>
 
 #define ORG 127
+
+static uint8_t controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
+static uint8_t metadataNumChunks = 0;
+static bool metadataLoaded = false;
+
+// Precomputed PIO responses for each metadata chunk
+static uint32_t metadataPioChunks[METADATA_MAX_CHUNKS][METADATA_CHUNK_TRANSFER_SIZE / 2 + 1];
+static int metadataPioChunkLens[METADATA_MAX_CHUNKS];
+static uint32_t metadataAckPioResult[2];
+static int metadataAckPioResultLen;
+
+extern volatile bool _pleaseCommitMetadata;
 
 /* PIOs are separate state machines for handling IOs with high timing precision. You load a program into them and they do their stuff on their own with deterministic timing,
    communicating with the main cores via FIFOs (and interrupts, if you want).
@@ -57,6 +70,26 @@ void __time_critical_func(convertToPio)(const uint8_t* command, const int len, u
     }
     // End bit
     result[len / 2] += 3 << (2 * (8 * (len % 2)));
+}
+
+static void precomputeMetadataResponses() {
+    for (int c = 0; c < metadataNumChunks; c++) {
+        uint8_t chunkTransfer[METADATA_CHUNK_TRANSFER_SIZE];
+        chunkTransfer[0] = metadataNumChunks;
+        chunkTransfer[1] = c;
+        memcpy(&chunkTransfer[2], &controllerMetadata[c * METADATA_CHUNK_DATA_SIZE], METADATA_CHUNK_DATA_SIZE);
+        convertToPio(chunkTransfer, METADATA_CHUNK_TRANSFER_SIZE, metadataPioChunks[c], metadataPioChunkLens[c]);
+    }
+}
+
+static void loadControllerMetadata() {
+    if (!metadataLoaded) {
+        getControllerMetadata(controllerMetadata, metadataNumChunks);
+        metadataLoaded = true;
+        precomputeMetadataResponses();
+        uint8_t ack[1] = { 0x01 };
+        convertToPio(ack, 1, metadataAckPioResult, metadataAckPioResultLen);
+    }
 }
 
 void __time_critical_func(convertGCReport)(GCReport* report, GCReport* dest_report, uint8_t mode) {
@@ -149,6 +182,8 @@ void __time_critical_func(enterMode)(const int dataPin,
     pio_sm_clear_fifos(pio, 0);
     pio_sm_set_enabled(pio, 0, true);
 
+    loadControllerMetadata();
+
     while (true) {
 		uint8_t joybusByte = pio_sm_get_blocking(pio, 0);
 
@@ -201,6 +236,43 @@ void __time_critical_func(enterMode)(const int dataPin,
             } else {
                 pwm_set_gpio_level(rumblePin, 0);
                 pwm_set_gpio_level(brakePin, rumbleBrake ? 255 : 0);
+            }
+
+            (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
+        }
+        else if (joybusByte == 0xA0) { // Read controller metadata chunk
+            uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
+
+            if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
+
+            for (int i = 0; i<metadataPioChunkLens[chunkIndex]; i++) {
+                pio_sm_put_blocking(pio, 0, metadataPioChunks[chunkIndex][i]);
+            }
+
+            (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
+        }
+        else if (joybusByte == 0xB0) { // Write controller metadata chunk
+            uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
+
+            uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+            for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+                chunkData[i] = pio_sm_get_blocking(pio, 0);
+            }
+
+            for (int i = 0; i<metadataAckPioResultLen; i++) {
+                pio_sm_put_blocking(pio, 0, metadataAckPioResult[i]);
+            }
+
+            bool validChunk = chunkIndex < METADATA_MAX_CHUNKS;
+            if (validChunk) {
+                // Writing chunk 0 starts a new write sequence — reset count
+                // so stale chunks from a previous (larger) write are discarded.
+                if (chunkIndex == 0) metadataNumChunks = 0;
+                memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+                if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
+                precomputeMetadataResponses();
+                setControllerMetadata(controllerMetadata, metadataNumChunks);
+                _pleaseCommitMetadata = true;
             }
 
             (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue

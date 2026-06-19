@@ -6,6 +6,7 @@
 
 #include "phobGCC.h"
 #include "comms/joybus.hpp"
+#include "storage/pages/metadata.h"
 #include "cvideo.h"
 #include "cvideo_variables.h"
 #include "hardware/clocks.h"
@@ -14,6 +15,7 @@ volatile bool _videoOut = false;
 //Variables used by PhobVision to communicate with the event loop core
 volatile bool _sync = false;
 volatile uint8_t _pleaseCommit = 0;//255 = redraw please
+volatile bool _pleaseCommitMetadata = false;
 int _currentCalStep = -1;//-1 means not calibrating
 int _currentRemapStep = -1;//-1 means not remapping
 bool _currentlyRaw = false;
@@ -69,6 +71,11 @@ void second_core() {
 		static bool undoCal = false;
 
 
+		//when requested by the other core, commit the metadata
+		if(_pleaseCommitMetadata) {
+			commitMetadata();
+			_pleaseCommitMetadata = false;
+		}
 		//when requested by the other core, commit the settings
 		if(_pleaseCommit != 0) {
 			if(_pleaseCommit == 1) {
