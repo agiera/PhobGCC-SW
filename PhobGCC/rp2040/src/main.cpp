@@ -9,9 +9,16 @@
 #include "storage/pages/metadata.h"
 #include "cvideo.h"
 #include "cvideo_variables.h"
+#include "displayList.h"
+#include "games/ping.h"
 #include "hardware/clocks.h"
 
+extern unsigned char _bitmap[];
+
 volatile bool _videoOut = false;
+volatile bool _videoOverSi = false;
+volatile bool _siSync = false;
+int _videoVersion = 0;
 //Variables used by PhobVision to communicate with the event loop core
 volatile bool _sync = false;
 volatile uint8_t _pleaseCommit = 0;//255 = redraw please
@@ -60,6 +67,16 @@ void second_core() {
 
 
 	while(true) { //main event loop
+		static bool _siSyncTimerStarted = false;
+		static repeating_timer_t _siSyncTimer;
+		if(_videoOverSi && !_siSyncTimerStarted) {
+			add_repeating_timer_us(-16667, [](repeating_timer_t*) -> bool {
+				_siSync = true;
+				return true;
+			}, nullptr, &_siSyncTimer);
+			_siSyncTimerStarted = true;
+		}
+
 		//Set up persistent storage for calibration
 		static float tempCalPointsX[_noOfCalibrationPoints];
 		static float tempCalPointsY[_noOfCalibrationPoints];
@@ -703,7 +720,7 @@ void second_core() {
 		//pwm_set_gpio_level(_pinLED, 255*gpio_get_out_level(_pinSpare0));
 
 		//check if we should be reporting values yet
-		if((_hardware.B || _controls.autoInit || _videoOut) && !running){
+		if((_hardware.B || _controls.autoInit || _videoOut || _videoOverSi) && !running){
 			running=true;
 		}
 
@@ -755,6 +772,57 @@ void second_core() {
 		else if(running){
 			//if not calibrating read the sticks normally
 			readSticks(true,true, _btn, _pinList, _raw, _hardware, _controls, _normGains, _aStickParams, _cStickParams, _dT, _currentCalStep, _currentlyRaw);
+		}
+
+		if(_videoOverSi && !_videoOut) {
+			static unsigned int siMenuIndex = 0;
+			static int siItemIndex = 0;
+			static uint8_t siRedraw = 1;
+			static bool siChangeMade = false;
+
+			if(!_siSync) {
+				continue;
+			}
+			_siSync = false;
+
+			if(_pleaseCommit == 255) {
+				siRedraw = 1;
+				_pleaseCommit = 0;
+			}
+
+			if(_pleaseCommit == 100) {
+				if(runPing(_bitmap, _hardware, _raw, _controls)) {
+					_pleaseCommit = 99;
+				}
+			}
+
+			if(_pleaseCommit < 100) {
+				handleMenuButtons(_bitmap, siMenuIndex, siItemIndex, siRedraw, siChangeMade,
+				                  _currentCalStep, _currentRemapStep, _pleaseCommit,
+				                  _btn, _hardware, _controls, _dataCapture);
+
+				if(siRedraw == 2) {
+					displayListBeginFrame(VWIDTH, VHEIGHT, siRedraw);
+					siRedraw = 0;
+					drawMenuFast(_bitmap, siMenuIndex, siItemIndex, siChangeMade,
+					             _currentCalStep, _currentRemapStep,
+					             _btn, _hardware, _raw, _controls,
+					             _aStickParams, _cStickParams);
+					displayListEndFrame();
+					precomputeDisplayListChunks();
+				} else if(siRedraw == 1) {
+					displayListBeginFrame(VWIDTH, VHEIGHT, siRedraw);
+					siRedraw = 0;
+					memset(_bitmap, BLACK2, BUFFERLEN);
+					displayListRecordClear(BLACK2);
+					drawMenu(_bitmap, siMenuIndex, siItemIndex, siChangeMade,
+					         _currentCalStep, _currentRemapStep, _videoVersion,
+					         _btn, _raw, _controls, _aStickParams, _cStickParams,
+					         _dataCapture);
+					displayListEndFrame();
+					precomputeDisplayListChunks();
+				}
+			}
 		}
 
 		//read the controller's buttons
@@ -882,12 +950,17 @@ int main() {
 	//Run comms unless Z is held while plugging in
 	if(_hardware.Z) {
 #ifdef BUILD_DEV
-		const int version = -SW_VERSION;
+		_videoVersion = -SW_VERSION;
 #else //BUILD_DEV
-		const int version = SW_VERSION;
+		_videoVersion = SW_VERSION;
 #endif //BUILD_DEV
-		videoOut(_pinDac0, _btn, _hardware, _raw, _controls, _aStickParams, _cStickParams, _dataCapture, _sync, _pleaseCommit, _currentCalStep, _currentRemapStep, version);
+		videoOut(_pinDac0, _btn, _hardware, _raw, _controls, _aStickParams, _cStickParams, _dataCapture, _sync, _pleaseCommit, _currentCalStep, _currentRemapStep, _videoVersion);
 	} else {
+#ifdef BUILD_DEV
+		_videoVersion = -SW_VERSION;
+#else //BUILD_DEV
+		_videoVersion = SW_VERSION;
+#endif //BUILD_DEV
 		enterMode(_pinTX,
 				_pinRumble,
 				_pinBrake,

@@ -5,6 +5,7 @@
 #include "pico.h"
 #include "cvideo.h"
 #include "cvideo_variables.h"
+#include "displayList.h"
 #include "images/font.h"
 
 //Misc graphics drawing routines go here.
@@ -84,6 +85,7 @@ void drawLine(unsigned char bitmap[],
 	if(x0 >= VWIDTH || x1 >= VWIDTH || y0 >= VHEIGHT || y1 >= VHEIGHT) {
 		return;
 	}
+	displayListRecordLine(x0, y0, x1, y1, color);
 	if(abs(y1-y0) < abs(x1-x0)) {
 		if(x0 > x1) {
 			drawLineLow(bitmap, x1, y1, x0, y0, color);
@@ -135,6 +137,7 @@ void drawString(unsigned char bitmap[],
 			    const uint8_t color,
 			    const char string[],
                 const uint8_t charLimit) {
+	displayListRecordString(x0, y0, color, 1, string, charLimit);
 	uint16_t i = 0;
 	const char nullChar[] = "";
 	while(string[i] != nullChar[0] && i < charLimit) {
@@ -190,6 +193,7 @@ void drawString2x(unsigned char bitmap[],
 			      const uint8_t color,
 			      const char string[],
                   const uint8_t charLimit) {
+	displayListRecordString(x0, y0, color, 2, string, charLimit);
 	uint16_t i = 0;
 	const char nullChar[] = "";
 	while(string[i] != nullChar[0] && i < charLimit) {
@@ -296,11 +300,13 @@ void drawInt2x(unsigned char bitmap[],
 
 void eraseCharLine(unsigned char bitmap[],
 		const uint16_t y0) {
+	displayListRecordFillRows(y0, 15, BLACK2);
 	memset(bitmap + y0*VWIDTHBYTE, BLACK2, 15*VWIDTHBYTE);
 }
 
 void eraseRows(unsigned char bitmap[],
 		const uint16_t y0,
 		const uint16_t rows) {
+	displayListRecordFillRows(y0, rows, BLACK2);
 	memset(bitmap + y0*VWIDTHBYTE, BLACK2, rows*VWIDTHBYTE);
 }

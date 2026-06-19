@@ -1257,27 +1257,27 @@ void drawXYScope(unsigned char bitmap[],
 			break;
 		case 1:
 			drawString(bitmap, 300, 70, 15, stickmap1);
-			drawImage(bitmap, deadzone_image, deadzone_indexes, 1, 40);
+				drawImage(bitmap, deadzone_image, deadzone_indexes, 1, 40, IMAGE_DEADZONE);
 			break;
 		case 2:
 			drawString(bitmap, 300, 70, 15, stickmap2);
-			drawImage(bitmap, await_image, await_indexes, 1, 40);
+				drawImage(bitmap, await_image, await_indexes, 1, 40, IMAGE_AWAIT);
 			break;
 		case 3:
 			drawString(bitmap, 300, 70, 15, stickmap3);
-			drawImage(bitmap, movewait_image, movewait_indexes, 1, 40);
+				drawImage(bitmap, movewait_image, movewait_indexes, 1, 40, IMAGE_MOVEWAIT);
 			break;
 		case 4:
 			drawString(bitmap, 300, 70, 15, stickmap4);
-			drawImage(bitmap, crouch_image, crouch_indexes, 1, 40);
+				drawImage(bitmap, crouch_image, crouch_indexes, 1, 40, IMAGE_CROUCH);
 			break;
 		case 5:
 			drawString(bitmap, 300, 70, 15, stickmap5);
-			drawImage(bitmap, ledgeL_image, ledgeL_indexes, 1, 40);
+				drawImage(bitmap, ledgeL_image, ledgeL_indexes, 1, 40, IMAGE_LEDGE_L);
 			break;
 		case 6:
 			drawString(bitmap, 300, 70, 15, stickmap6);
-			drawImage(bitmap, ledgeR_image, ledgeR_indexes, 1, 40);
+				drawImage(bitmap, ledgeR_image, ledgeR_indexes, 1, 40, IMAGE_LEDGE_R);
 			break;
 		default:
 			break;
@@ -2026,7 +2026,7 @@ void drawMenu(unsigned char bitmap[],
 		DataCapture &capture) {
 	//Basic menus
 	if(MenuIndex[menu][1] == 0) {
-		drawImage(bitmap, Cute_Ghost, Cute_Ghost_Index, VWIDTH/2-112, 0);//224x300
+		drawImage(bitmap, Cute_Ghost, Cute_Ghost_Index, VWIDTH/2-112, 0, IMAGE_CUTE_GHOST);//224x300
 		drawString(bitmap, VWIDTH/2-105, 320, 15, splashWelcome);
 		drawString(bitmap, VWIDTH/2- 70, 340, 15, splashPress);
 		drawString(bitmap,           10, 340, 15, "v0.");

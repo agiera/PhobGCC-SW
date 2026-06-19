@@ -7,10 +7,18 @@
 #include "hardware/clocks.h"
 #include "joybus.pio.h"
 #include "storage/pages/metadata.h"
+#include "displayList.h"
 #include <string.h>
 #include <math.h>
 
 #define ORG 127
+
+// 0xC0 display-list transfer layout:
+// [0]=numChunks, [1]=chunkIndex, [2..511]=510 bytes payload
+#define DISPLAY_LIST_CHUNK_DATA_SIZE 510
+#define DISPLAY_LIST_CHUNK_TRANSFER_SIZE 512
+#define DISPLAY_LIST_MAX_BYTES 4096
+#define DISPLAY_LIST_MAX_CHUNKS ((DISPLAY_LIST_MAX_BYTES + DISPLAY_LIST_CHUNK_DATA_SIZE - 1) / DISPLAY_LIST_CHUNK_DATA_SIZE)
 
 static uint8_t controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
 static uint8_t metadataNumChunks = 0;
@@ -22,7 +30,15 @@ static int metadataPioChunkLens[METADATA_MAX_CHUNKS];
 static uint32_t metadataAckPioResult[2];
 static int metadataAckPioResultLen;
 
+// Double-buffered precomputed PIO responses for each display-list chunk.
+static uint32_t displayListPioChunks[2][DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE / 2 + 1];
+static int displayListPioChunkLens[2][DISPLAY_LIST_MAX_CHUNKS];
+static volatile uint8_t displayListActiveBuf = 0;
+static volatile int8_t displayListReaderBuf = -1;
+static volatile uint8_t displayListNumChunks = 0;
+
 extern volatile bool _pleaseCommitMetadata;
+extern volatile bool _videoOverSi;
 
 /* PIOs are separate state machines for handling IOs with high timing precision. You load a program into them and they do their stuff on their own with deterministic timing,
    communicating with the main cores via FIFOs (and interrupts, if you want).
@@ -90,6 +106,46 @@ static void loadControllerMetadata() {
         uint8_t ack[1] = { 0x01 };
         convertToPio(ack, 1, metadataAckPioResult, metadataAckPioResultLen);
     }
+}
+
+void precomputeDisplayListChunks() {
+    const uint8_t* data = displayListGetData();
+    uint16_t size = displayListGetSize();
+
+    uint8_t nChunks = (uint8_t)((size + DISPLAY_LIST_CHUNK_DATA_SIZE - 1) / DISPLAY_LIST_CHUNK_DATA_SIZE);
+    if (nChunks == 0) nChunks = 1;
+    if (nChunks > DISPLAY_LIST_MAX_CHUNKS) nChunks = DISPLAY_LIST_MAX_CHUNKS;
+
+    uint8_t writeBuf = displayListActiveBuf ^ 1;
+
+    while (displayListReaderBuf == (int8_t)writeBuf) {
+        tight_loop_contents();
+    }
+
+    for (uint8_t c = 0; c < nChunks; c++) {
+        static uint8_t transfer[DISPLAY_LIST_CHUNK_TRANSFER_SIZE];
+        transfer[0] = nChunks;
+        transfer[1] = c;
+
+        uint16_t off = (uint16_t)c * DISPLAY_LIST_CHUNK_DATA_SIZE;
+        uint16_t remaining = (size > off) ? (uint16_t)(size - off) : 0;
+        uint16_t copy = (remaining < DISPLAY_LIST_CHUNK_DATA_SIZE) ? remaining : DISPLAY_LIST_CHUNK_DATA_SIZE;
+
+        if (copy > 0) {
+            memcpy(&transfer[2], &data[off], copy);
+        }
+        if (copy < DISPLAY_LIST_CHUNK_DATA_SIZE) {
+            memset(&transfer[2 + copy], 0, DISPLAY_LIST_CHUNK_DATA_SIZE - copy);
+        }
+
+        convertToPio(transfer,
+                     DISPLAY_LIST_CHUNK_TRANSFER_SIZE,
+                     displayListPioChunks[writeBuf][c],
+                     displayListPioChunkLens[writeBuf][c]);
+    }
+
+    displayListActiveBuf = writeBuf;
+    displayListNumChunks = nChunks;
 }
 
 void __time_critical_func(convertGCReport)(GCReport* report, GCReport* dest_report, uint8_t mode) {
@@ -183,6 +239,7 @@ void __time_critical_func(enterMode)(const int dataPin,
     pio_sm_set_enabled(pio, 0, true);
 
     loadControllerMetadata();
+    precomputeDisplayListChunks();
 
     while (true) {
 		uint8_t joybusByte = pio_sm_get_blocking(pio, 0);
@@ -277,6 +334,26 @@ void __time_critical_func(enterMode)(const int dataPin,
 
             (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
         }
+        else if (joybusByte == 0xC0) { // Read display-list chunk
+            _videoOverSi = true;
+            uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
+
+            uint8_t buf = displayListActiveBuf;
+            displayListReaderBuf = (int8_t)buf;
+            uint8_t n = displayListNumChunks;
+            if (n == 0) {
+                displayListReaderBuf = -1;
+                (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
+                continue;
+            }
+            if (chunkIndex >= n) chunkIndex = 0;
+
+            for (int i = 0; i < displayListPioChunkLens[buf][chunkIndex]; i++) {
+                pio_sm_put_blocking(pio, 0, displayListPioChunks[buf][chunkIndex][i]);
+            }
+            displayListReaderBuf = -1;
+            (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
+        }
         else {
             pio_sm_set_enabled(pio, 0, false);
             sleep_us(400);
@@ -289,6 +366,147 @@ void __time_critical_func(enterMode)(const int dataPin,
             pio_sm_exec(pio, 0, pio_encode_jmp(offset + joybus_offset_inmode_clean));
             pio_sm_set_enabled(pio, 0, true);
         }
+    }
+}
+
+static PIO sVideoPio = pio1;
+static uint sVideoSm = 0;
+static uint sVideoOffset = 0;
+static bool sVideoInited = false;
+
+static GCReport videoDefaultReport() {
+    GCReport r{};
+    r.pad1 = 1;
+    r.xStick = ORG;
+    r.yStick = ORG;
+    r.cxStick = ORG;
+    r.cyStick = ORG;
+    return r;
+}
+
+void initJoybusForVideoMode(int dataPin) {
+    if (sVideoInited) return;
+
+    gpio_init(dataPin);
+    gpio_set_dir(dataPin, GPIO_IN);
+    gpio_pull_up(dataPin);
+    sleep_us(100);
+
+    pio_gpio_init(sVideoPio, dataPin);
+    sVideoOffset = pio_add_program(sVideoPio, &joybus_program);
+
+    pio_sm_config config = joybus_program_get_default_config(sVideoOffset);
+    sm_config_set_in_pins(&config, dataPin);
+    sm_config_set_out_pins(&config, dataPin, 1);
+    sm_config_set_set_pins(&config, dataPin, 1);
+    const float pioTargetHz = 25000000.0f;
+    float clkdiv = (float)clock_get_hz(clk_sys) / pioTargetHz;
+    sm_config_set_clkdiv(&config, clkdiv);
+    sm_config_set_out_shift(&config, true, false, 32);
+    sm_config_set_in_shift(&config, false, true, 8);
+    sm_config_set_mov_status(&config, STATUS_TX_LESSTHAN, 1);
+    sm_config_set_jmp_pin(&config, dataPin);
+
+    pio_sm_init(sVideoPio, sVideoSm, sVideoOffset, &config);
+    pio_sm_exec(sVideoPio, sVideoSm, pio_encode_jmp(sVideoOffset + joybus_offset_inmode_clean));
+    pio_sm_clear_fifos(sVideoPio, sVideoSm);
+    pio_sm_set_enabled(sVideoPio, sVideoSm, true);
+
+    loadControllerMetadata();
+    sVideoInited = true;
+}
+
+void serviceJoybusForVideoMode(std::function<GCReport()> reportFn) {
+    if (!sVideoInited) return;
+    if (pio_sm_is_rx_fifo_empty(sVideoPio, sVideoSm)) return;
+
+    uint8_t joybusByte = (uint8_t)pio_sm_get(sVideoPio, sVideoSm);
+
+    if (joybusByte == 0) { // Probe
+        uint8_t probeResponse[3] = { 0x09, 0x00, 0x03 };
+        uint32_t result[2];
+        int resultLen;
+        convertToPio(probeResponse, 3, result, resultLen);
+        for (int i = 0; i < resultLen; i++) pio_sm_put_blocking(sVideoPio, sVideoSm, result[i]);
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else if (joybusByte == 0x41) { // Origin
+        uint8_t originResponse[10] = { 0x00, 0x80, ORG, ORG, ORG, ORG, 0, 0, 0, 0 };
+        uint32_t result[6];
+        int resultLen;
+        convertToPio(originResponse, 10, result, resultLen);
+        for (int i = 0; i < resultLen; i++) pio_sm_put_blocking(sVideoPio, sVideoSm, result[i]);
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else if (joybusByte == 0x40) { // Poll
+        GCReport gcReport = reportFn ? reportFn() : videoDefaultReport();
+        GCReport dest_report;
+
+        joybusByte = pio_sm_get_blocking(sVideoPio, sVideoSm);
+        convertGCReport(&gcReport, &dest_report, joybusByte);
+
+        uint32_t result[5];
+        int resultLen;
+        convertToPio((uint8_t*)(&dest_report), 8, result, resultLen);
+
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+        for (int i = 0; i < resultLen; i++) pio_sm_put_blocking(sVideoPio, sVideoSm, result[i]);
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else if (joybusByte == 0xA0) { // Read metadata chunk
+        uint8_t chunkIndex = pio_sm_get_blocking(sVideoPio, sVideoSm);
+        if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
+        for (int i = 0; i < metadataPioChunkLens[chunkIndex]; i++) {
+            pio_sm_put_blocking(sVideoPio, sVideoSm, metadataPioChunks[chunkIndex][i]);
+        }
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else if (joybusByte == 0xB0) { // Write metadata chunk
+        uint8_t chunkIndex = pio_sm_get_blocking(sVideoPio, sVideoSm);
+        uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
+        for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
+            chunkData[i] = pio_sm_get_blocking(sVideoPio, sVideoSm);
+        }
+
+        if (chunkIndex < METADATA_MAX_CHUNKS) {
+            if (chunkIndex == 0) metadataNumChunks = 0;
+            memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+            if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
+            precomputeMetadataResponses();
+            setControllerMetadata(controllerMetadata, metadataNumChunks);
+            _pleaseCommitMetadata = true;
+        }
+
+        for (int i = 0; i < metadataAckPioResultLen; i++) {
+            pio_sm_put_blocking(sVideoPio, sVideoSm, metadataAckPioResult[i]);
+        }
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else if (joybusByte == 0xC0) { // Read display-list chunk
+        _videoOverSi = true;
+        uint8_t chunkIndex = pio_sm_get_blocking(sVideoPio, sVideoSm);
+        uint8_t buf = displayListActiveBuf;
+        displayListReaderBuf = (int8_t)buf;
+        uint8_t n = displayListNumChunks;
+        if (n == 0) {
+            displayListReaderBuf = -1;
+            (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+            return;
+        }
+        if (chunkIndex >= n) chunkIndex = 0;
+        for (int i = 0; i < displayListPioChunkLens[buf][chunkIndex]; i++) {
+            pio_sm_put_blocking(sVideoPio, sVideoSm, displayListPioChunks[buf][chunkIndex][i]);
+        }
+        displayListReaderBuf = -1;
+        (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
+    }
+    else {
+        pio_sm_set_enabled(sVideoPio, sVideoSm, false);
+        sleep_us(400);
+        pio_sm_clear_fifos(sVideoPio, sVideoSm);
+        pio_sm_restart(sVideoPio, sVideoSm);
+        pio_sm_exec(sVideoPio, sVideoSm, pio_encode_jmp(sVideoOffset + joybus_offset_inmode_clean));
+        pio_sm_set_enabled(sVideoPio, sVideoSm, true);
     }
 }
 
