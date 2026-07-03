@@ -12,6 +12,7 @@
 #include "displayList.h"
 #include "games/ping.h"
 #include "hardware/clocks.h"
+#include <cstring>
 
 extern unsigned char _bitmap[];
 

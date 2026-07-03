@@ -309,6 +309,8 @@ void __time_critical_func(enterMode)(const int dataPin,
             (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
         }
         else if (joybusByte == 0xB0) { // Write controller metadata chunk
+            // Payload mirrors read responses: [total_chunks][chunk_index][data]
+            uint8_t totalChunks = pio_sm_get_blocking(pio, 0);
             uint8_t chunkIndex = pio_sm_get_blocking(pio, 0);
 
             uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
@@ -320,16 +322,20 @@ void __time_critical_func(enterMode)(const int dataPin,
                 pio_sm_put_blocking(pio, 0, metadataAckPioResult[i]);
             }
 
-            bool validChunk = chunkIndex < METADATA_MAX_CHUNKS;
+            bool validChunk =
+                totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
             if (validChunk) {
-                // Writing chunk 0 starts a new write sequence — reset count
-                // so stale chunks from a previous (larger) write are discarded.
-                if (chunkIndex == 0) metadataNumChunks = 0;
                 memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-                if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
+
+                // Keep metadata hidden while a burst is still in flight. Once
+                // the final chunk arrives, publish and commit exactly once.
+                bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+                metadataNumChunks = isFinalChunk ? totalChunks : 0;
                 precomputeMetadataResponses();
-                setControllerMetadata(controllerMetadata, metadataNumChunks);
-                _pleaseCommitMetadata = true;
+                if (isFinalChunk) {
+                    setControllerMetadata(controllerMetadata, metadataNumChunks);
+                    _pleaseCommitMetadata = true;
+                }
             }
 
             (void)pio_sm_get_blocking(pio, 0); // discard stop-bit residue
@@ -462,19 +468,26 @@ void serviceJoybusForVideoMode(std::function<GCReport()> reportFn) {
         (void)pio_sm_get_blocking(sVideoPio, sVideoSm);
     }
     else if (joybusByte == 0xB0) { // Write metadata chunk
+        // Payload mirrors read responses: [total_chunks][chunk_index][data]
+        uint8_t totalChunks = pio_sm_get_blocking(sVideoPio, sVideoSm);
         uint8_t chunkIndex = pio_sm_get_blocking(sVideoPio, sVideoSm);
         uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
         for (int i = 0; i < METADATA_CHUNK_DATA_SIZE; i++) {
             chunkData[i] = pio_sm_get_blocking(sVideoPio, sVideoSm);
         }
 
-        if (chunkIndex < METADATA_MAX_CHUNKS) {
-            if (chunkIndex == 0) metadataNumChunks = 0;
+        bool validChunk =
+            totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
+        if (validChunk) {
             memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-            if (chunkIndex + 1 > metadataNumChunks) metadataNumChunks = chunkIndex + 1;
+
+            bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+            metadataNumChunks = isFinalChunk ? totalChunks : 0;
             precomputeMetadataResponses();
-            setControllerMetadata(controllerMetadata, metadataNumChunks);
-            _pleaseCommitMetadata = true;
+            if (isFinalChunk) {
+                setControllerMetadata(controllerMetadata, metadataNumChunks);
+                _pleaseCommitMetadata = true;
+            }
         }
 
         for (int i = 0; i < metadataAckPioResultLen; i++) {
