@@ -33,6 +33,10 @@ static int metadataAckPioResultLen;
 // Double-buffered precomputed PIO responses for each display-list chunk.
 static uint32_t displayListPioChunks[2][DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE / 2 + 1];
 static int displayListPioChunkLens[2][DISPLAY_LIST_MAX_CHUNKS];
+// Double-buffered raw (non-PIO-encoded) chunk transfers, used to serve
+// display-list reads over WebUSB. Each entry mirrors the on-wire response:
+// [numChunks][chunkIndex][510 payload bytes].
+static uint8_t displayListRawChunks[2][DISPLAY_LIST_MAX_CHUNKS][DISPLAY_LIST_CHUNK_TRANSFER_SIZE];
 static volatile uint8_t displayListActiveBuf = 0;
 static volatile int8_t displayListReaderBuf = -1;
 static volatile uint8_t displayListNumChunks = 0;
@@ -142,10 +146,86 @@ void precomputeDisplayListChunks() {
                      DISPLAY_LIST_CHUNK_TRANSFER_SIZE,
                      displayListPioChunks[writeBuf][c],
                      displayListPioChunkLens[writeBuf][c]);
+
+        // Keep a raw copy of the same transfer for the WebUSB path, which
+        // returns unencoded bytes rather than PIO-encoded words.
+        memcpy(displayListRawChunks[writeBuf][c], transfer, DISPLAY_LIST_CHUNK_TRANSFER_SIZE);
     }
 
     displayListActiveBuf = writeBuf;
     displayListNumChunks = nChunks;
+}
+
+// Buffer-based equivalent of the enterMode() Joybus command handlers, used to
+// service commands that arrive over WebUSB instead of the physical Joybus line.
+// Handles the subset of opcodes the calibration host uses: 0xA0 (read metadata
+// chunk), 0xB0 (write metadata chunk), 0xC0 (read display-list chunk).
+// Returns the number of raw response bytes written to `resp`, or 0 when the
+// command is unhandled or no data is ready yet (the host retries).
+int handleWebusbJoybusCommand(const uint8_t* cmd, int cmdLen, uint8_t* resp, int maxResp) {
+    if (cmdLen < 1) return 0;
+
+    switch (cmd[0]) {
+        case 0xA0: { // Read controller metadata chunk: [0xA0, chunkIndex]
+            if (cmdLen < 2 || maxResp < METADATA_CHUNK_TRANSFER_SIZE) return 0;
+            loadControllerMetadata();
+            uint8_t chunkIndex = cmd[1];
+            if (chunkIndex >= metadataNumChunks) chunkIndex = 0;
+            resp[0] = metadataNumChunks;
+            resp[1] = chunkIndex;
+            memcpy(&resp[2], &controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], METADATA_CHUNK_DATA_SIZE);
+            return METADATA_CHUNK_TRANSFER_SIZE;
+        }
+        case 0xB0: { // Write metadata chunk: [0xB0, totalChunks, chunkIndex, ...78 data]
+            if (cmdLen < 3 + METADATA_CHUNK_DATA_SIZE || maxResp < 1) return 0;
+            loadControllerMetadata();
+            uint8_t totalChunks = cmd[1];
+            uint8_t chunkIndex = cmd[2];
+            const uint8_t* chunkData = &cmd[3];
+
+            bool validChunk =
+                totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
+            if (validChunk) {
+                memcpy(&controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
+
+                // Keep metadata hidden while a burst is still in flight. Once
+                // the final chunk arrives, publish and commit exactly once.
+                bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+                metadataNumChunks = isFinalChunk ? totalChunks : 0;
+                precomputeMetadataResponses();
+                if (isFinalChunk) {
+                    setControllerMetadata(controllerMetadata, metadataNumChunks);
+                    _pleaseCommitMetadata = true;
+                }
+            }
+
+            resp[0] = 0x01; // ack
+            return 1;
+        }
+        case 0xC0: { // Read display-list chunk: [0xC0, chunkIndex]
+            if (cmdLen < 2) return 0;
+            _videoOverSi = true;
+            uint8_t chunkIndex = cmd[1];
+
+            uint8_t buf = displayListActiveBuf;
+            displayListReaderBuf = (int8_t)buf;
+            uint8_t n = displayListNumChunks;
+            if (n == 0) {
+                displayListReaderBuf = -1;
+                return 0; // no frame ready yet; host will poll again
+            }
+            if (chunkIndex >= n) chunkIndex = 0;
+            if (maxResp < DISPLAY_LIST_CHUNK_TRANSFER_SIZE) {
+                displayListReaderBuf = -1;
+                return 0;
+            }
+            memcpy(resp, displayListRawChunks[buf][chunkIndex], DISPLAY_LIST_CHUNK_TRANSFER_SIZE);
+            displayListReaderBuf = -1;
+            return DISPLAY_LIST_CHUNK_TRANSFER_SIZE;
+        }
+        default:
+            return 0;
+    }
 }
 
 void __time_critical_func(convertGCReport)(GCReport* report, GCReport* dest_report, uint8_t mode) {

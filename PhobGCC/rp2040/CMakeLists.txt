@@ -25,6 +25,7 @@ add_executable(phobgcc_rp2040
 	src/main.cpp
 	src/navigateMenu.cpp
 	src/storage.cpp
+	src/usb/webusb.cpp
 	src/games/ping.cpp
 	)
 
@@ -54,6 +55,7 @@ target_link_libraries(phobgcc_rp2040
 	pico_bootrom
 	pico_multicore
 	pico_platform
+	tinyusb_device
 	hardware_adc
 	hardware_dma
 	hardware_flash
@@ -64,4 +66,7 @@ target_link_libraries(phobgcc_rp2040
 	hardware_timer)
 
 pico_add_extra_outputs(phobgcc_rp2040)
-pico_enable_stdio_usb(phobgcc_rp2040 1)
+# USB is used for the WebUSB calibration interface, so it can't also be the
+# stdio backend. Route debug stdio to UART instead.
+pico_enable_stdio_usb(phobgcc_rp2040 0)
+pico_enable_stdio_uart(phobgcc_rp2040 1)

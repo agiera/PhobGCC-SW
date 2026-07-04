@@ -12,6 +12,7 @@
 #include "displayList.h"
 #include "games/ping.h"
 #include "hardware/clocks.h"
+#include "usb/webusb.h"
 #include <cstring>
 
 extern unsigned char _bitmap[];
@@ -947,6 +948,18 @@ int main() {
 	multicore_lockout_victim_init();
 
 	multicore_launch_core1(second_core);
+
+	//If plugged into a PC (USB VBUS present) rather than a GameCube, serve the
+	//WebUSB calibration interface instead of the Joybus protocol. core1 keeps
+	//reading sticks and producing display lists for the host to read.
+	if(webusbVbusPresent()) {
+#ifdef BUILD_DEV
+		_videoVersion = -SW_VERSION;
+#else //BUILD_DEV
+		_videoVersion = SW_VERSION;
+#endif //BUILD_DEV
+		webusbRun();//never returns
+	}
 
 	//Run comms unless Z is held while plugging in
 	if(_hardware.Z) {

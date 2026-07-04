@@ -36,4 +36,18 @@ void serviceJoybusForVideoMode(std::function<GCReport()> reportFn);
  */
 void precomputeDisplayListChunks();
 
+/**
+ * @short Handle a Joybus command that arrived over WebUSB rather than the
+ *        physical Joybus line. Supports the calibration host opcodes 0xA0
+ *        (read metadata chunk), 0xB0 (write metadata chunk) and 0xC0 (read
+ *        display-list chunk).
+ *
+ * @param cmd      Raw command bytes (starting with the opcode)
+ * @param cmdLen   Number of command bytes
+ * @param resp     Output buffer for the raw response bytes
+ * @param maxResp  Capacity of the output buffer
+ * @return         Number of response bytes written, or 0 if unhandled / not ready
+ */
+int handleWebusbJoybusCommand(const uint8_t* cmd, int cmdLen, uint8_t* resp, int maxResp);
+
 #endif
