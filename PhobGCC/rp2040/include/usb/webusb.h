@@ -8,11 +8,13 @@ extern "C" {
 #include <stdbool.h>
 
 /**
- * @short Returns true if USB VBUS is present (the controller is plugged into a
- *        host such as a PC), false when powered by a GameCube. Safe to call
- *        before tusb_init(); it powers up only the USB VBUS sense logic and,
- *        when no VBUS is found, leaves the USB controller held in reset so it
- *        cannot interfere with the timing-critical Joybus path.
+ * @short Returns true when the controller is plugged into a real USB host (such
+ *        as a PC), false when powered by a GameCube/Wii. The RP2040 cannot sense
+ *        USB VBUS on this board, so this brings the USB device up briefly and
+ *        checks whether a host actually enumerates it; if none does within a
+ *        short timeout the USB controller is held in reset so it cannot interfere
+ *        with the timing-critical Joybus path. On a true result TinyUSB is left
+ *        initialised, ready for webusbRun().
  */
 bool webusbVbusPresent(void);
 

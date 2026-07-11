@@ -15,7 +15,6 @@
 #include "comms/joybus.hpp"
 
 #include "hardware/resets.h"
-#include "hardware/structs/usb.h"
 #include "pico/time.h"
 
 #include <string.h>
@@ -303,24 +302,38 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 // VBUS detection & service loop
 //--------------------------------------------------------------------+
 bool webusbVbusPresent(void) {
-    // Power up the USB controller just enough to sense VBUS.
-    reset_block(RESETS_RESET_USBCTRL_BITS);
-    unreset_block_wait(RESETS_RESET_USBCTRL_BITS);
-    usb_hw->muxing = USB_USB_MUXING_TO_PHY_BITS | USB_USB_MUXING_SOFTCON_BITS;
-    usb_hw->pwr = USB_USB_PWR_VBUS_DETECT_BITS | USB_USB_PWR_VBUS_DETECT_OVERRIDE_EN_BITS;
-    busy_wait_us(50);
+    // The RP2040 has no dedicated VBUS pin, and this board does not route USB
+    // VBUS to a spare GPIO, so the 5V rail cannot be sensed directly (forcing
+    // the SIE VBUS_DETECT override, as this used to, simply reports "present"
+    // unconditionally). Instead, bring the USB device up and see whether a real
+    // USB host answers: a PC issues a bus reset and begins enumeration (SETUP
+    // packets) within a few hundred milliseconds, whereas a GameCube/Wii — which
+    // talks only over the Joybus data line, not USB — never does. If no host
+    // responds we tear the USB controller back down so it cannot perturb the
+    // timing-critical Joybus path.
+    tusb_init();
 
-    bool present = (usb_hw->sie_status & USB_SIE_STATUS_VBUS_DETECTED_BITS) != 0;
-
-    if (!present) {
-        // Leave the USB controller inert so it cannot perturb the Joybus path.
-        reset_block(RESETS_RESET_USBCTRL_BITS);
+    const uint32_t timeoutUs = 500'000; // 500 ms is ample for a host bus reset
+    const uint32_t start = time_us_32();
+    while (time_us_32() - start < timeoutUs) {
+        tud_task();
+        if (tud_connected()) {
+            return true; // a USB host is enumerating us -> stay in WebUSB mode
+        }
     }
-    return present;
+
+    // No USB host answered; make sure USB can't interfere with Joybus.
+    tud_disconnect();
+    reset_block(RESETS_RESET_USBCTRL_BITS);
+    return false;
 }
 
 void webusbRun(void) {
-    tusb_init();
+    // webusbVbusPresent() already initialised TinyUSB when it detected a host;
+    // guard against a redundant re-init in case the call order ever changes.
+    if (!tusb_inited()) {
+        tusb_init();
+    }
     while (true) {
         tud_task();
     }
