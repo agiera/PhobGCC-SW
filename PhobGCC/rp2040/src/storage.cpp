@@ -497,7 +497,7 @@ static void getMetadataPage() {
 		}
 		if(blank) {
 			// Build a minimal UBJSON object: { "firmware": "PhobGCC <SW_VERSION>" }
-			// UBJSON form used: { S U <len_key> <key_bytes> S U <len_val> <val_bytes> }
+			// UBJSON form used: { U <len_key> <key_bytes> S U <len_val> <val_bytes> }
 			uint8_t *p = (uint8_t*)_metadata.controllerMetadata;
 			int idx = 0;
 			const char *key = "firmware";
@@ -508,8 +508,8 @@ static void getMetadataPage() {
 			// Object start
 			p[idx++] = 0x7B; // '{'
 
-			// Key: string marker 'S', length marker 'U' (uint8), length, bytes
-			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
+			// Object keys are implicitly strings: length marker 'U', length, bytes
+			p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
 			memcpy(&p[idx], key, strlen(key)); idx += (int)strlen(key);
 
 			// Value: string marker, length marker, length, bytes

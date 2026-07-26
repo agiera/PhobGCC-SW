@@ -572,8 +572,8 @@ static void getMetadataPage() {
 			// Object start
 			p[idx++] = 0x7B; // '{'
 
-			// Key: string marker 'S', length marker 'U' (uint8), length, bytes
-			p[idx++] = 'S'; p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
+			// Object keys are implicitly strings: length marker 'U', length, bytes
+			p[idx++] = 'U'; p[idx++] = (uint8_t)strlen(key);
 			memcpy(&p[idx], key, strlen(key)); idx += (int)strlen(key);
 
 			// Value: string marker, length marker, length, bytes
