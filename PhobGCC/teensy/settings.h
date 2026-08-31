@@ -65,7 +65,7 @@ namespace Eeprom {
 #define METADATA_CHUNK_DATA_SIZE 78
 #define METADATA_CHUNK_TRANSFER_SIZE 80
 #define METADATA_MAX_CHUNKS 8
-// total size is 1008
+// total size is 624
 #define CONTROLLER_METADATA_MAX_SIZE (METADATA_MAX_CHUNKS * METADATA_CHUNK_DATA_SIZE)
 
 // Default metadata blob is generated at runtime (UBJSON) in getControllerMetadata()

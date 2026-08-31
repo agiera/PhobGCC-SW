@@ -9,6 +9,8 @@ using std::max;
 //Uncomment to get a glowing LED on Teensy 4.
 //#define ENABLE_LED
 
+#include "version.h"
+
 //Uncomment the appropriate #include line for your hardware by deleting the two slashes at the beginning of the line.
 //#include "../teensy/Phob1_0Teensy3_2.h"          // For PhobGCC board 1.0 with Teensy 3.2
 //#include "../teensy/Phob1_0Teensy3_2DiodeShort.h"// For PhobGCC board 1.0 with Teensy 3.2 and the diode shorted
@@ -25,7 +27,6 @@ using std::max;
 #include "filter.h"
 #include "stick.h"
 #include "../extras/extras.h"
-#include "version.h"
 
 #define BUILD_RELEASE
 //#define BUILD_DEV

@@ -78,8 +78,12 @@ const int _slowBaud = 2000000;
 const int _probeLength = 24;
 const int _originLength = 80;
 const int _pollLength = 64;
-static char _serialBuffer[128];
-static char _writeBuffer[128];
+// Must be large enough for a full metadata chunk transfer: on T4.0 each joybus
+// bit takes 1 serial byte, so a chunk needs up to METADATA_CHUNK_TRANSFER_SIZE*8
+// (640) serial bytes buffered before commInt() drains it; 128 silently overflows.
+static const int _serialBufferSize = METADATA_CHUNK_TRANSFER_SIZE * 8 + 32;
+static char _serialBuffer[_serialBufferSize];
+static char _writeBuffer[_serialBufferSize];
 int _errorCount = 0;
 int _reportCount = 0;
 
@@ -116,7 +120,6 @@ static uint8_t _controllerMetadata[CONTROLLER_METADATA_MAX_SIZE];
 static uint8_t _metadataNumChunks = 0;
 static bool _metadataLoaded = false;
 static bool _waitingMetaRead = false;
-static uint8_t _metaReadChunkIndex = 0;
 static bool _waitingMetaWrite = false;
 
 // Precomputed serial responses for each metadata chunk (128 bytes per chunk transfer)
@@ -364,13 +367,17 @@ void commInt() {
 			while(Serial2.available() <= _bitQueue){}
 			_waitingMetaWrite = false;
 
-			//decode chunk index from second command byte (8 serial bytes = 1 joybus byte)
+			//decode total chunk count and chunk index (8 serial bytes = 1 joybus byte each)
+			uint8_t totalChunks = 0;
+			for(int i = 0; i < 8; i++){
+				totalChunks = (totalChunks << 1) | (Serial2.read() > 0b11110000);
+			}
 			uint8_t chunkIndex = 0;
 			for(int i = 0; i < 8; i++){
 				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
 			}
 
-			//decode 126 data bytes from serial (each bit = 1 serial byte)
+			//decode data bytes from serial (each bit = 1 serial byte)
 			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
 			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
 				uint8_t byte = 0;
@@ -381,13 +388,18 @@ void commInt() {
 			}
 			Serial2.clear();
 
-			if(chunkIndex < METADATA_MAX_CHUNKS){
+			bool validChunk = totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
+			if(validChunk){
 				_loadControllerMetadata();
 				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
 
-				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				//keep metadata hidden while a burst is still in flight; publish and commit once the final chunk arrives
+				bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+				_metadataNumChunks = isFinalChunk ? totalChunks : 0;
 				_setMetadataResponses();
+				if(isFinalChunk){
+					setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				}
 			}
 
 			//send precomputed ack response (0x01)
@@ -503,7 +515,7 @@ void commInt() {
 			//write controller metadata command (0xB0)
 			else if(_cmdByte == 0b10110000){
 				_waitingMetaWrite = true;
-				_bitQueue = 8 + METADATA_CHUNK_DATA_SIZE * 8; // 1 index byte + 126 data bytes
+				_bitQueue = 16 + METADATA_CHUNK_DATA_SIZE * 8; // 2 header bytes (totalChunks, chunkIndex) + data bytes
 			}
 			//if we got something else then something went wrong, print the command we got and increase the error count
 			else{
@@ -617,13 +629,17 @@ void commInt() {
 			_waitingMetaWrite = false;
 			_bitQueue = 8;
 
-			//decode chunk index from second command byte
+			//decode total chunk count and chunk index
+			uint8_t totalChunks = 0;
+			for(int i = 0; i < 8; i++){
+				totalChunks = (totalChunks << 1) | (Serial2.read() > 0b11110000);
+			}
 			uint8_t chunkIndex = 0;
 			for(int i = 0; i < 8; i++){
 				chunkIndex = (chunkIndex << 1) | (Serial2.read() > 0b11110000);
 			}
 
-			//decode 126 data bytes
+			//decode data bytes
 			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
 			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
 				uint8_t byte = 0;
@@ -634,13 +650,18 @@ void commInt() {
 			}
 			Serial2.clear();
 
-			if(chunkIndex < METADATA_MAX_CHUNKS){
+			bool validChunk = totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
+			if(validChunk){
 				_loadControllerMetadata();
 				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
 
-				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				//keep metadata hidden while a burst is still in flight; publish and commit once the final chunk arrives
+				bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+				_metadataNumChunks = isFinalChunk ? totalChunks : 0;
 				_setMetadataResponses();
+				if(isFinalChunk){
+					setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				}
 			}
 
 			//send precomputed ack
@@ -751,7 +772,7 @@ void commInt() {
 			//write controller metadata command (0xB0)
 			else if(_cmdByte == 0b10110000){
 				_waitingMetaWrite = true;
-				_bitQueue = 8 + METADATA_CHUNK_DATA_SIZE * 8; // 1 index byte + 126 data bytes
+				_bitQueue = 16 + METADATA_CHUNK_DATA_SIZE * 8; // 2 header bytes (totalChunks, chunkIndex) + data bytes
 			}
 			//if we got something else then something went wrong, print the command we got and increase the error count
 			else{
@@ -920,8 +941,16 @@ void communicate(){
 		//write controller metadata (0xB0)
 		case 0xB0:
 		{
-			//read second command byte (chunk index) + 126 data bytes
-			//second command byte: 4 serial bytes
+			//read total-chunks byte + chunk-index byte (each 4 serial bytes, own stop bit) + data bytes
+			while(Serial2.available() < _cmdLengthShort){}
+			uint8_t totalChunks = 0;
+			for(int i = 0; i < (_cmdLengthShort - 1); i++){
+				int cmd = Serial2.read();
+				bool bitOne = cmd & 0b00000010;
+				bool bitTwo = cmd & 0b01000000;
+				totalChunks = (totalChunks << 1) + bitOne;
+				totalChunks = (totalChunks << 1) + bitTwo;
+			}
 			while(Serial2.available() < _cmdLengthShort){}
 			uint8_t chunkIndex = 0;
 			for(int i = 0; i < (_cmdLengthShort - 1); i++){
@@ -931,9 +960,9 @@ void communicate(){
 				chunkIndex = (chunkIndex << 1) + bitOne;
 				chunkIndex = (chunkIndex << 1) + bitTwo;
 			}
-			Serial2.clear(); // clear stop bit from second command byte
+			Serial2.clear(); // clear stop bit from chunk-index byte
 
-			//read 126 data bytes (126 * 4 = 504 serial bytes + stop bit)
+			//read data bytes (each byte = 4 serial bytes, no stop bit until the final one)
 			uint8_t chunkData[METADATA_CHUNK_DATA_SIZE];
 			for(int d = 0; d < METADATA_CHUNK_DATA_SIZE; d++){
 				int dataByte = 0;
@@ -951,15 +980,20 @@ void communicate(){
 			while(!Serial2.available());
 			Serial2.clear();
 
-			const int dataSerialLen = METADATA_CHUNK_DATA_SIZE * (_cmdLengthShort - 1); // 126 * 4 = 504
+			const int dataSerialLen = METADATA_CHUNK_DATA_SIZE * (_cmdLengthShort - 1); // 78 * 4 = 312
 
-			if(chunkIndex < METADATA_MAX_CHUNKS){
+			bool validChunk = totalChunks >= 1 && totalChunks <= METADATA_MAX_CHUNKS && chunkIndex < totalChunks;
+			if(validChunk){
 				_loadControllerMetadata();
 				memcpy(&_controllerMetadata[chunkIndex * METADATA_CHUNK_DATA_SIZE], chunkData, METADATA_CHUNK_DATA_SIZE);
-				if(chunkIndex + 1 > _metadataNumChunks) _metadataNumChunks = chunkIndex + 1;
 
-				setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				//keep metadata hidden while a burst is still in flight; publish and commit once the final chunk arrives
+				bool isFinalChunk = (chunkIndex + 1 == totalChunks);
+				_metadataNumChunks = isFinalChunk ? totalChunks : 0;
 				_setMetadataResponses();
+				if(isFinalChunk){
+					setControllerMetadata(_controllerMetadata, _metadataNumChunks);
+				}
 			}
 
 			//send precomputed ack
@@ -968,7 +1002,7 @@ void communicate(){
 				Serial2.write(_metadataAck[i]);
 			}
 			Serial2.write(0xFF);
-			_writeQueue = _cmdLengthShort*2-1 + _cmdLengthShort*2-1 + dataSerialLen*2 + 1 + _metadataAckLen*2 + 1;
+			_writeQueue = _cmdLengthShort*2-1 + _cmdLengthShort*2-1 + _cmdLengthShort*2-1 + dataSerialLen*2 + 1 + _metadataAckLen*2 + 1;
 			_commStatus = _commWrite;
 		}
 		break;
@@ -1034,10 +1068,10 @@ void commsSetup(Buttons &btn) {
 
 	//set up communication interrupts, serial, and timers
 #ifdef TEENSY4_0
-    Serial2.addMemoryForRead(_serialBuffer,128);
+    Serial2.addMemoryForRead(_serialBuffer,_serialBufferSize);
 	attachInterrupt(_pinInt, commInt, RISING);
 #ifdef HALFDUPLEX
-	Serial2.addMemoryForWrite(_writeBuffer, 128);
+	Serial2.addMemoryForWrite(_writeBuffer, _serialBufferSize);
 	Serial2.begin(_slowBaud,SERIAL_HALF_DUPLEX);
 	//Serial2.setTX(8,true);
 	timer1.begin(resetSerial);
